@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "duddy-comfyui"
+version = "0.1.0"
+description = "让 AI 在你的 ComfyUI 画布上先规划、经批准、再逐节点动手"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "duddy-comfyui contributors" }]
+keywords = ["comfyui", "mcp", "llm", "agent", "workflow"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/wuddy/duddy-comfyui"
+Issues = "https://github.com/wuddy/duddy-comfyui/issues"
+
+[tool.setuptools]
+packages = ["comfyui_duddy"]
