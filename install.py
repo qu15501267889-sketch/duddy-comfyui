@@ -66,22 +66,58 @@ def http_json(url: str, timeout: float = 3.0):
         return None
 
 
-def detect_from_api() -> dict:
-    """最可靠：ComfyUI 自己告诉我们它在哪、用哪个 python 跑的。"""
-    info = http_json(COMFY_URL + "/system_stats")
-    if not info:
-        return {}
-    out = {}
-    argv = (info.get("system") or {}).get("argv") or []
-    # argv[0] 通常是 ComfyUI/main.py 或 main.py
-    for a in argv:
-        if a.replace("\\", "/").endswith("main.py"):
-            main_py = os.path.abspath(a)
-            comfy_dir = os.path.dirname(main_py)
-            parent = os.path.dirname(comfy_dir)
-            out["comfy_dir"] = comfy_dir
-            out["parent"] = parent
+def _as_comfy_dir(path: str) -> str:
+    """把任意一个 ComfyUI 子目录往上溯，找到含 main.py 的那一层。"""
+    if not path:
+        return ""
+    p = os.path.abspath(path.replace("\\", os.sep).replace("/", os.sep))
+    for _ in range(6):  # 最多上溯 6 层，防止跑到盘根
+        if os.path.isfile(os.path.join(p, "main.py")):
+            return p
+        parent = os.path.dirname(p)
+        if parent == p:
             break
+        p = parent
+    return ""
+
+
+def detect_from_api() -> dict:
+    """最可靠：问运行中的 ComfyUI 要目录信息。
+
+    /system_stats 的 argv 里 main.py 往往是相对路径，拿不到绝对位置；
+    而 /internal/folder_paths 返回的全是绝对路径，从 models/ 反推最准。
+    """
+    out = {}
+
+    # 路径一：folder_paths（首选）
+    fp = http_json(COMFY_URL + "/internal/folder_paths")
+    if isinstance(fp, dict):
+        for _key, paths in fp.items():
+            if not isinstance(paths, list):
+                continue
+            for p in paths:
+                if not isinstance(p, str):
+                    continue
+                cand = _as_comfy_dir(p)
+                if cand:
+                    out["comfy_dir"] = cand
+                    out["parent"] = os.path.dirname(cand)
+                    return out
+
+    # 路径二：argv（只在它是绝对路径时可信）
+    info = http_json(COMFY_URL + "/system_stats")
+    if info:
+        argv = (info.get("system") or {}).get("argv") or []
+        for a in argv:
+            if not isinstance(a, str):
+                continue
+            norm = a.replace("\\", "/")
+            if norm.endswith("main.py") and os.path.isabs(norm):
+                cand = _as_comfy_dir(os.path.dirname(os.path.abspath(norm)))
+                if cand:
+                    out["comfy_dir"] = cand
+                    out["parent"] = os.path.dirname(cand)
+                    return out
     return out
 
 
