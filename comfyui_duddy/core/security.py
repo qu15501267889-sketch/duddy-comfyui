@@ -127,14 +127,31 @@ def init_guard() -> Dict[str, str]:
 
 
 class ApprovalVault:
-    """内存中的 plan_id -> token 指纹映射。进程重启即失效（刻意的）。"""
+    """内存中的 plan_id -> token 映射。进程重启即失效（刻意的）。
+
+    issue() 默认复用未过期的 token。原因：前端重连/刷新时后端会重推未决计划，
+    如果每次都签发新 token，旧 token 立刻失效，而浏览器里可能还留着
+    旧事件渲染出来的弹窗——用户点「同意」就会带着死 token 撞 403。
+    复用同一个 token 让「重推」变成幂等操作。
+    """
 
     def __init__(self) -> None:
         self._items: Dict[str, Dict[str, object]] = {}
 
-    def issue(self, plan_id: str) -> str:
+    def issue(self, plan_id: str, reuse: bool = True) -> str:
+        item = self._items.get(plan_id)
+        if reuse and item:
+            if time.time() - float(item["issued_at"]) <= APPROVAL_TTL:  # type: ignore[arg-type]
+                return str(item["token"])
+            self._items.pop(plan_id, None)
+
         token = new_token()
-        self._items[plan_id] = {"fp": token_fingerprint(token), "issued_at": time.time()}
+        self._items[plan_id] = {
+            "fp": token_fingerprint(token),
+            "token": token,
+            "issued_at": time.time(),
+            "issued_count": int((item or {}).get("issued_count", 0)) + 1,
+        }
         return token
 
     def verify(self, plan_id: str, token: str) -> bool:

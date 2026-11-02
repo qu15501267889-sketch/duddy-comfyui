@@ -480,9 +480,12 @@ function showPlan(evt) {
         <div id="duddy-progress-text" style="color:#8a8a96;font-size:11.5px;margin-top:5px"></div>
       </div>
     </div>
-    <div id="duddy-actions" style="padding:10px 14px;border-top:1px solid #3a3a44;display:flex;gap:8px;justify-content:flex-end">
-      <button id="duddy-reject" style="padding:7px 14px;border-radius:7px;background:#2a2a32;color:#c8c8d0;border:1px solid #3a3a44;cursor:pointer;font-size:12.5px">拒绝</button>
-      <button id="duddy-approve" style="padding:7px 16px;border-radius:7px;background:#2f6fed;color:#fff;border:none;cursor:pointer;font-size:12.5px;font-weight:600">同意并执行</button>
+    <div id="duddy-actions" style="padding:10px 14px;border-top:1px solid #3a3a44;display:flex;flex-direction:column;gap:8px">
+      <div id="duddy-approve-hint" style="color:#ff9b9b;font-size:11.5px;line-height:1.4"></div>
+      <div style="display:flex;gap:8px;justify-content:flex-end">
+        <button id="duddy-reject" style="padding:7px 14px;border-radius:7px;background:#2a2a32;color:#c8c8d0;border:1px solid #3a3a44;cursor:pointer;font-size:12.5px">拒绝</button>
+        <button id="duddy-approve" style="padding:7px 16px;border-radius:7px;background:#2f6fed;color:#fff;border:none;cursor:pointer;font-size:12.5px;font-weight:600">同意并执行</button>
+      </div>
     </div>
   `;
   el.style.display = "flex";
@@ -491,7 +494,7 @@ function showPlan(evt) {
   el.querySelector("#duddy-reject").onclick = async () => {
     await post(`/duddy/plan/${plan.plan_id}/reject`, {
       reason: "用户在弹窗中点了拒绝",
-      token,
+      token: (D.active && D.active.token) || token,
       client_id: D.clientId,
     });
     setPill("已拒绝，AI 不会动你的画布", 2200);
@@ -499,10 +502,14 @@ function showPlan(evt) {
   };
   el.querySelector("#duddy-approve").onclick = async () => {
     const btn = el.querySelector("#duddy-approve");
+    const hint = el.querySelector("#duddy-approve-hint");
     btn.disabled = true;
     btn.textContent = "批准中…";
+    if (hint) hint.textContent = "";
     const r = await post(`/duddy/plan/${plan.plan_id}/approve`, {
-      token,
+      // 用 D.active.token 而不是闭包里的 token：
+      // 同一计划被重推时会换 token，闭包捕获的会过期
+      token: (D.active && D.active.token) || token,
       by: "ui",
       client_id: D.clientId,
     });
@@ -517,6 +524,9 @@ function showPlan(evt) {
       btn.disabled = false;
       btn.textContent = "批准失败，重试";
       btn.style.background = "#a33";
+      const why =
+        (r.data && (r.data.error || r.data.kind)) || `HTTP ${r.status}`;
+      if (hint) hint.textContent = `失败原因：${why}`;
       WARN("approve failed", r);
     }
   };
@@ -598,9 +608,19 @@ app.registerExtension({
 
     // ② 业务处理与传输方式解耦，先全部注册好
     on("duddy.plan.proposed", (d) => {
-      LOG("plan proposed", d.plan && d.plan.plan_id);
-      if (D.active && !D.active.approved) D.queue.push(d);
-      else showPlan(d);
+      const pid = (d.plan || {}).plan_id;
+      LOG("plan proposed", pid);
+      // 同一计划的重复推送（刷新重推 / 轮询重放）：只刷新 token，不重建弹窗
+      if (D.active && D.active.plan.plan_id === pid) {
+        D.active.token = d.token;
+        LOG("同一计划重推，token 已更新");
+        return;
+      }
+      if (D.active && !D.active.approved) {
+        D.queue.push(d);
+      } else {
+        showPlan(d);
+      }
     });
     on("duddy.plan.approved", () => setPill("AI 已获授权，开始动手", 1800));
     on("duddy.plan.rejected", () => setPill("计划已拒绝", 1800));
