@@ -21,6 +21,7 @@ REQUIRED_ARGS: Dict[str, List[str]] = {
     "connect": ["from_slot", "to_slot"],
     "disconnect": [],
     "set_widget": ["widget"],
+    "set_title": ["title"],
     "move_node": ["pos"],
     "delete_node": [],
     "group": [],

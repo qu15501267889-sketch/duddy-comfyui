@@ -185,6 +185,18 @@ function applyWidgets(node, widgets) {
       failed.push({ widget: name, reason: String(e) });
     }
   }
+
+  // 有些自定义节点（如 AusBoss WorkflowNote）把值渲染进 DOM 面板，
+  // 面板只在 onConfigure 时重读 widget.value。
+  // 光改值画面不动，必须踢它一下让它重新渲染。
+  if (applied.length && node.__ausbossNote && typeof node.onConfigure === "function") {
+    try {
+      node.onConfigure({});
+    } catch (e) {
+      WARN("自定义面板刷新失败", e);
+    }
+  }
+
   return { applied, failed };
 }
 
@@ -312,6 +324,15 @@ async function executeOp(op) {
         g.setDirtyCanvas(true, true);
         if (res.failed.length) return { ok: false, detail: { reason: "widget_failed", ...res } };
         return { ok: true, detail: { node_id: node.id, ...res } };
+      }
+
+      case "set_title": {
+        const node = resolveRef(a.ref, a.node_id);
+        if (!node) return { ok: false, detail: { reason: "node_missing", ref: a.ref } };
+        const old = node.title;
+        node.title = String(a.title);
+        g.setDirtyCanvas(true, true);
+        return { ok: true, detail: { node_id: node.id, old_title: old, new_title: node.title } };
       }
 
       case "move_node": {

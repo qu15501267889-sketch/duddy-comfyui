@@ -39,6 +39,7 @@ ALLOWED_KINDS = {
     "connect",
     "disconnect",
     "set_widget",
+    "set_title",
     "move_node",
     "delete_node",
     "group",
