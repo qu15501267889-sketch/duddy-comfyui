@@ -91,8 +91,10 @@ function attachWsEvents() {
   KNOWN_EVENTS.forEach((t) => {
     try {
       api.addCustomEventListener(t, (e) => {
-        const d = payloadOf(e);
-        dispatch(t, d, d && d.seq);
+        // 注意：seq 在外层 payload 上，不能先剥壳再取，否则去重失效
+        const outer = (e && e.detail) || {};
+        const payload = outer.data || outer;
+        dispatch(t, payload, outer.seq);
       });
       ok += 1;
     } catch (err) {
@@ -101,6 +103,22 @@ function attachWsEvents() {
   });
   LOG(`已注册 ${ok}/${KNOWN_EVENTS.length} 个自定义事件`);
   return ok > 0;
+}
+
+/** 把 lastSeq 对齐到服务器当前最新，避免页面刷新后轮询重放历史画布操作。 */
+async function alignSeq() {
+  try {
+    const r = await api.fetchApi("/duddy/events?limit=1");
+    const j = await r.json();
+    const list = j.data || [];
+    if (list.length) {
+      const newest = list[list.length - 1].seq;
+      if (newest > D.lastSeq) D.lastSeq = newest;
+    }
+    LOG("seq 对齐到", D.lastSeq);
+  } catch (e) {
+    WARN("seq 对齐失败", e);
+  }
 }
 
 /* ------------------------------------------------------------------ 工具 */
@@ -315,8 +333,18 @@ function executeOp(op) {
 
 /* ---------------------------------------------------------- 执行操作流水 */
 
+/** 已执行过的 (plan_id, step_index)。哪怕传输层出任何岔子，
+ *  同一步也绝不会在画布上执行第二次——这是最后一道硬保护。 */
+const executed = new Set();
+
 async function runStep(payload) {
   const { plan_id, step_index, total, op, dry_run } = payload;
+  const key = `${plan_id}#${step_index}`;
+  if (executed.has(key)) {
+    WARN("重复的 canvas.op，已忽略", key);
+    return;
+  }
+  executed.add(key);
   D.busy = true;
   setPill(`第 ${step_index + 1}/${total} 步 · ${op.title || op.kind}`);
 
@@ -631,12 +659,7 @@ app.registerExtension({
     on("duddy.plan.done", () => setPill("计划执行完毕 ✓", 2600));
     on("duddy.plan.failed", () => setPill("计划执行失败", 3200, true));
 
-    // ③ 挂传输层：ws 已在 attachWsEvents 里注册，这里只决定轮询节奏
-    if (wsOk) {
-      startPolling(2000); // 慢兜底：ws 丢包 2 秒内也能补上
-    } else {
-      startPolling(500); // ws 不可用，靠轮询扛
-    }
+    // ③ 传输层在 hello + alignSeq 之后才启动（见 ⑥）
 
     // ComfyUI 重启后 ws 会重连，但 setup() 不会重跑 —— 必须主动重新报到
     api.addEventListener("reconnected", () => {
@@ -652,6 +675,16 @@ app.registerExtension({
 
     // ④ 最后才报到：hello 会让后端把未决计划重推一遍
     await sayHello("setup");
+
+    // ⑤ 报到完把 seq 对齐，避免轮询把刷新前的历史 op 重放出来
+    await alignSeq();
+
+    // ⑥ 传输层兜底
+    if (wsOk) {
+      startPolling(2000); // 慢兜底：ws 丢包 2 秒内也能补上
+    } else {
+      startPolling(500); // ws 不可用，靠轮询扛
+    }
   },
 
   async nodeCreated(node) {
