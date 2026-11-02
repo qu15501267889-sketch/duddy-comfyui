@@ -342,6 +342,13 @@ function esc(s) {
   return String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
 
+/** ComfyUI 的 send_sync 会在外面再包一层 {type, data}，
+ *  所以我们自己塞的 {v, seq, ts, type, data} 位于 detail.data。 */
+function payloadOf(e) {
+  const d = (e && e.detail) || {};
+  return d.data || d;
+}
+
 function closeModal() {
   if (modalEl) modalEl.style.display = "none";
   D.active = null;
@@ -470,20 +477,31 @@ async function pushCanvasState() {
 
 /* -------------------------------------------------------------- 扩展注册 */
 
+async function sayHello(reason) {
+  D.clientId = api.clientId || D.clientId || null;
+  const r = await post("/duddy/client/hello", {
+    client_id: D.clientId,
+    ua: navigator.userAgent,
+    page: location.pathname,
+  }).catch(() => null);
+  if (r && r.data && r.data.ok) {
+    LOG(`hello ok (${reason}) clientId=${D.clientId}`);
+  } else {
+    WARN(`hello failed (${reason})`, r);
+  }
+  return r;
+}
+
 app.registerExtension({
   name: "duddy.control",
   async setup() {
     D.clientId = api.clientId || null;
     LOG("extension setup, clientId=", D.clientId);
 
-    await post("/duddy/client/hello", {
-      client_id: D.clientId,
-      ua: navigator.userAgent,
-      page: location.pathname,
-    }).catch(() => null);
+    await sayHello("setup");
 
     api.addEventListener("duddy.plan.proposed", (e) => {
-      const d = e.detail || {};
+      const d = payloadOf(e);
       LOG("plan proposed", d.plan && d.plan.plan_id);
       if (D.active && !D.active.approved) {
         D.queue.push(d);
@@ -493,7 +511,7 @@ app.registerExtension({
     });
 
     api.addEventListener("duddy.plan.approved", (e) => {
-      LOG("plan approved", e.detail);
+      LOG("plan approved", payloadOf(e));
       setPill("AI 已获授权，开始动手", 1800);
     });
 
@@ -502,12 +520,22 @@ app.registerExtension({
     });
 
     api.addEventListener("duddy.canvas.op", (e) => {
-      const d = e.detail || {};
+      const d = payloadOf(e);
       LOG("op received", d.step_index, d.op && d.op.kind);
       runStep(d);
     });
 
     api.addEventListener("duddy.plan.done", () => setPill("计划执行完毕 ✓", 2600));
+
+    // ComfyUI 重启 / 断线重连：setup 不会重跑，但连接已经是新的一条了，
+    // 必须主动报到一次，否则后端还以为前端不在线。
+    api.addEventListener("reconnected", () => {
+      LOG("ws reconnected — 重新报到");
+      sayHello("reconnected");
+    });
+    api.addEventListener("reconnecting", () => {
+      setPill("与 ComfyUI 的连接断开，重连中…", 0, true);
+    });
 
     setInterval(pushCanvasState, 8000);
     setTimeout(pushCanvasState, 2500);

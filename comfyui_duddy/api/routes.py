@@ -30,7 +30,7 @@ POLL_SEC = 0.12
 
 # (plan_id, step_index) -> 前端回报
 _pending: Dict[tuple, Dict[str, Any]] = {}
-_routes = None
+_registered = False
 
 
 def _ok(data: Any = None, **extra) -> web.Response:
@@ -395,33 +395,46 @@ def build_routes():
     return r
 
 
+def _attach_all(shared) -> int:
+    """把一张 RouteTableDef 里的路由搬到 ComfyUI 的共享 routes 上。"""
+    n = 0
+    for r in build_routes():
+        getattr(shared, r.method.lower())(r.path)(r.handler)
+        n += 1
+    return n
+
+
 def register_routes() -> bool:
     """挂载路由。
 
-    正常时序下 PromptServer 已实例化，直接挂。
-    若实例尚未创建（某些启动路径 / 测试环境），hook 构造函数，
-    等它一被创建就立刻补挂，避免整包静默失效。
+    坑：这版 ComfyUI 的 PromptServer.add_routes() 是**无参**内部方法
+    （它负责把 self.routes 交给 aiohttp），不能当「添加路由」用——
+    传参进去会 TypeError。正确姿势是把路由定义到共享的
+    PromptServer.instance.routes（RouteTableDef）上，由 ComfyUI 统一注册。
     """
-    global _routes
+    global _registered
+    if _registered:
+        return True
     try:
         from server import PromptServer  # type: ignore
 
-        _routes = build_routes()
         inst = getattr(PromptServer, "instance", None)
-        if inst is not None:
-            inst.add_routes(_routes)
-            logger.info("[duddy] routes registered under %s", P)
+        if inst is not None and getattr(inst, "routes", None) is not None:
+            n = _attach_all(inst.routes)
+            _registered = True
+            logger.info("[duddy] %d 条路由已挂到共享 routes（前缀 %s）", n, P)
             return True
 
-        logger.warning("[duddy] PromptServer 尚未实例化，挂到构造钩子上等待")
+        logger.warning("[duddy] PromptServer 尚未就绪，挂到构造钩子上等待")
         original_init = PromptServer.__init__
 
         def _patched_init(self, *a, **kw):  # type: ignore[no-untyped-def]
             original_init(self, *a, **kw)
             try:
-                if _routes is not None:
-                    self.add_routes(_routes)
-                    logger.info("[duddy] routes registered (deferred) under %s", P)
+                if not globals().get("_registered") and getattr(self, "routes", None) is not None:
+                    n = _attach_all(self.routes)
+                    globals()["_registered"] = True
+                    logger.info("[duddy] %d 条路由已挂载（延迟生效）", n)
             except Exception as e:
                 logger.error("[duddy] deferred route registration failed: %s", e)
 
