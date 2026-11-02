@@ -1,88 +1,124 @@
-# Qwen Image 2.1 工作流研究
+# Qwen Image 2.1 工作流研究（五遍深挖）
 
-对 Civitai 上 **71 个 Qwen 2.1 相关 ComfyUI 工作流**的结构分析。
+对 Civitai 上 **71 个 Qwen 2.1 ComfyUI 工作流**的五轮分析。每一轮换一个角度，越钻越深。
 
-## 数据来源
+## 数据底座
 
-- 站点：civitai.com
-- 筛选：`baseModels=Qwen 2.1`，类型 `Workflows`
-- 排序：Highest Rated
-- 抓取时间：2026-11-02
-- 原始清单：`D:\AI\学习工作流\_index\models_raw.json`
-- 工作流文件：`D:\AI\学习工作流\<模型名> [id]\`（每个目录含 README + 工作流 json/zip）
-- 结构分析结果：`D:\AI\学习工作流\_index\analysis.json`
-
-同期还有 **21 个 Qwen 2.1 Checkpoint**（共 505 GB），本研究者只下工作流，不碰权重。
-
-## 核心结论（先看这个，后面都是细节）
-
-**1. 这群工作流有一个高度一致的架构范式。**
-绝大多数出自同一作者（AusBoss）。他的做法不是"画一张大图"，而是：
-
-```
-参数节点（Text / Seed / Integer / Boolean / 图片）
-        ↓
-   【子图 subgraph】← 真正的算法藏在这里，可折叠、可复用
-        ↓
-   后处理节点（Stitch / Compare / Save）
-```
-
-**外部只暴露"用户该改的东西"，内部逻辑封成子图。** 这是把工作流当产品做的思路，不是当草稿。
-
-**2. 子图（Subgraph）是 1.5x 版本最重要的新特性。**
-Tiled Upscale 的外部只有 19 个节点，看着简单；点开那个 UUID 节点，里面还有 11 个节点、19 条连线。不展开子图，等于没看懂。
-
-**3. Qwen 2.1 的编辑不是"图生图"，是"条件式重绘"。**
-原图走 `TextEncodeQwenImage21` 的 `image_1` 槽位变成条件，**不进 latent**。所以：
-- `denoise` 基本恒为 1
-- `cfg` 恒为 1（官方路径，此时负向提示词完全失效）
-- 想"少改"靠的是提示词和 LoRA，不是降 denoise
-
-**4. "把原图贴回去"是这系列工作流的通用手法。**
-扩图、放大、局部编辑都用了同一招：重绘完整画面 → 再用 `StitchInpaint` / `TiledUpscaleStitch` 把**不需要改的区域换回原始像素**。这样既保证接缝自然，又保证主体不变。
-
-**5. 自动 caption 解决了"扩图后场景漂移"的老问题。**
-Outpaint 工作流里有个 `TextGenerate` 节点，先让模型给原图写一段描述，再拼成
-`指令 + " Scene: " + 描述` 喂回去。让新生成的区域知道"这是个什么场景"。
-
-## 文档结构
-
-| 文件 | 内容 |
+| 项 | 值 |
 |---|---|
-| [01-architecture.md](01-architecture.md) | 共性架构范式：子图封装、参数外置、UI 层设计 |
-| [02-techniques.md](02-techniques.md) | 技术要点：tile 重绘、stitch 贴回、caption、LoRA 策略、参数取值 |
-| [03-cases.md](03-cases.md) | 逐个工作流拆解（Tiled Upscale / Person Swap / Outpaint / Multi-Image Edit） |
-| [04-lessons-for-duddy.md](04-lessons-for-duddy.md) | 这些经验怎么反哺 duddy-comfyui 本身 |
-| [05-ecosystem-patterns.md](05-ecosystem-patterns.md) | 非 AusBoss 体系的工程手法：无线连接、组旁路、参数流派 |
-| [06-parameter-fingerprint.md](06-parameter-fingerprint.md) | 58 个工作流的实际参数统计：cfg/steps/denoise/LoRA/提示词 |
-| [07-node-internals.md](07-node-internals.md) | 节点内部机制反推：三输出编码器、自动 caption 配置、填充色 |
+| 来源 | civitai.com，`baseModels=Qwen 2.1` + `Workflows`，Highest Rated |
+| 抓取 | 2026-11-02 |
+| 工作流 | 71 个（58 个可解析 JSON，13 个为 zip 或结构异常） |
+| 文件 | 113 个 / 34 MB |
+| 子图 | **66 个**（全部递归展开分析） |
+| 提示词语料 | **794 条**（659 普通 / 114 系统 / 21 负向） |
+| 同期 Checkpoint | 21 个 / 505 GB（未下载） |
 
-## 工作流清单（按类型）
+本地路径：`D:\AI\学习工作流\`（每个模型一个目录，含 README + 工作流文件 + `_meta.json`）
 
-### 放大 / 超分
-- Qwen Image 2.1 Tiled Upscale | Up to 8 MP（2988629）
+---
 
-### 换人 / 换装
-- Qwen Image 2.1 Person Swap | Head or Full Body（2980685）
-- Qwen Image 2.1 Outfit Swap | Virtual Try-On（2983126）
+## 五遍分别挖了什么
 
-### 扩图 / 旋转补全
-- Qwen Image 2.1 Outpaint | Auto Prompt（2964810）
-- Qwen Image 2.1 Rotate + Outpaint（2966883）
+### [第一遍 · 结构层](01-structure.md)
+子图骨架、连线模式、骨架聚类、封装率。
 
-### 抠图 / 去背景
-- Qwen Image 2.1 Cut Out + Remove | Transparent PNG（2987326）
+**最硬的发现**：
+- 66 个子图 / 58 个工作流，**子图是默认写法不是高级技巧**
+- 核心骨架只有一条：`LoadImage + CLIP + VAE → TextEncodeQwenImage21 → KSampler → VAEDecode`
+- 封装率从 0% 到 91%，同样功能有人摊 213 个节点，有人封 12 个
 
-### 角色设定图
-- [Qwen Image 2.1] Character Design Sheet Maker（2960750）
-- Qwen 2.1 Character Sheet Builder - No LLM（2966369）
-- Qwen Image 2.1 Character Reference Sheet Generator（2960890）
-- Qwen Image 2.1 Character Sheet Designer（2986253）
+### [第二遍 · 参数层](02-parameters.md)
+58 个工作流的实际 widget 值统计。
 
-### 通用生成 / 编辑
-- Qwen Image 2.1 Generate + Edit | Full Model, Auto Prompt（2962616）
-- Qwen Image 2.1 Edit + Realign | Stays in Place（2969862）
-- Qwen Image 2.1 Inpaint | Click to Mask（3000390）
-- Qwen Image 2.1 Turbo Generate + Edit | 8 Steps（2994247）
-- Qwen Image 2.1 Turbo Multi-Image Edit | 8 Steps（3000002）
-- Moody Qwen Image 2.1 Edit Workflow（3003715）
+**最硬的发现**：
+- `cfg=1` 占 90%（52:5），剩下 5 个用 7.5/8 是 SD 习惯残留
+- `denoise=1` 占 95%（57:3）
+- steps 三大流派：25（20次）/ 8（15次 Turbo）/ 4（4次）
+- `euler + simple` 是绝对主流（46/45）
+- LoRA 六件套，强度几乎全是 1.0
+
+### [第三遍 · 实现层](03-internals.md)
+从参数数组和连线反推节点内部机制。
+
+**最硬的发现**：
+- `TextEncodeQwenImage21` 是**三输出**节点（positive/negative/latent）
+- 它内部的 latent **只承担画布尺寸职责**，原图走 conditioning
+- 这解释了为什么 denoise 恒为 1 还能工作
+- 自动 caption 的确切配置：temperature 0.3 + 固定 seed + repetition_penalty 1.05
+- 扩图填充用 `#808080` 中灰，不用纯白纯黑
+
+### [第四遍 · 提示词层](04-prompts.md)
+794 条语料的分类与深读。
+
+**最硬的发现**：
+- 114 条系统提示词里，最精致的是一条 **17709 字**的「Edit Prompt Enhancer」
+- 它把语言决策拆成两套：**描述正文**跟指令语言，**图内渲染文字**走三优先级
+- 21 条负向词模板在 cfg=1 下**全部失效**
+- `<image1>` 是社区自发形成的占位符标准
+
+### [第五遍 · 评判层](05-judgement.md)
+缺陷清单、成熟度分级、生态空白、对 duddy 的动作项。
+
+**最硬的发现**：
+- 6 个工作流 cfg 用错，17 个没有输出节点
+- 产品级工作流几乎全是 AusBoss 一个人的
+- **生态空白**：没有 ControlNet、没有多轮编辑、批量几乎为零、没有种子管理
+- 真正有独立设计的只有 5 个工作流，其余是"换提示词"
+
+---
+
+## 六条可以直接用的结论
+
+**1. Qwen 2.1 的标准姿势**
+```
+cfg = 1 · denoise = 1 · euler · simple
+steps = 25（无加速）或 8（配 Turbo LoRA）
+resolution = 1024（要快）或 0（要保真）
+```
+
+**2. 负向提示词在 cfg=1 下是废的**
+想约束画面，把禁令改写成正向陈述塞进正向提示词。
+
+**3. Qwen 要句子不要标签**
+它是 LLM 编码的（Qwen3-VL），按语义理解。`masterpiece, 8k` 这种标签流效果很差。
+
+**4. 重绘后把原图贴回**
+`StitchInpaint` / `TiledUpscaleStitch`。比指望模型"保持不变"可靠一万倍。
+
+**5. 自动 caption 解决场景漂移**
+先让模型描述原图（temperature 0.3、seed 固定），拼成 `指令 + " Scene: " + 描述`。
+
+**6. 子图是这个生态的基本组织方式**
+66 个子图埋在 58 个工作流里。不展开子图，等于没看懂任何一个工作流。
+
+---
+
+## 给 duddy-comfyui 的行动清单
+
+| 优先级 | 事项 | 理由 |
+|---|---|---|
+| **P0** | 子图识别与递归展开 | UUID 类型当前被判成"未知节点"直接拦截 |
+| **P0** | `SetNode`/`GetNode` 变量引用解析 | 否者误判链路断开 |
+| **P1** | 模型参数规则表（cfg/denoise/负向词） | 解决"AI 不懂模型"的核心短板 |
+| **P2** | 日志数字解读（offload/显存） | 用户需要"该改什么"而不是原始日志 |
+| **P3** | 搭工作流的布局与封装规范 | 观感问题，不紧急 |
+
+---
+
+## 复现方式
+
+```bash
+python .tmp/fetch_civitai.py            # 拉元数据
+python .tmp/download_parallel.py        # 下载（需 CIVITAI_TOKEN）
+python .tmp/analyze_workflows.py        # 结构解析
+python .tmp/deep5.py                    # 五维深挖
+python .tmp/gen_readme.py               # 为每个工作流生成 README
+```
+
+产出文件：
+- `_index/models_raw.json` — 原始清单（71 工作流 + 21 Checkpoint）
+- `_index/analysis.json` — 逐文件结构
+- `_index/fingerprint.json` — 参数指纹
+- `_index/prompts.json` — 794 条语料（790 KB）
+- `_index/clusters.json` — 骨架聚类
