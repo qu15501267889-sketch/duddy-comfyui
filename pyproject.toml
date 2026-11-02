@@ -19,8 +19,8 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/wuddy/duddy-comfyui"
-Issues = "https://github.com/wuddy/duddy-comfyui/issues"
+Homepage = "https://github.com/qu15501267889-sketch/duddy-comfyui"
+Issues = "https://github.com/qu15501267889-sketch/duddy-comfyui/issues"
 
 [tool.setuptools]
 packages = ["comfyui_duddy"]

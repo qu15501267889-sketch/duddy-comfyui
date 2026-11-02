@@ -1,5 +1,8 @@
 # duddy-comfyui
 
+[![GitHub](https://img.shields.io/badge/GitHub-duddy--comfyui-181717?logo=github)](https://github.com/qu15501267889-sketch/duddy-comfyui)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 **让 AI 在你的 ComfyUI 画布上干活，但每一笔都要你点头。**
 
 不是「AI 生成一份 workflow JSON 然后 POST 过去」，而是：AI 先提交一份**分步计划**，你在 ComfyUI 界面右下角的弹窗里看清楚每一步要建什么节点、连哪根线，点「同意」之后，它才**一步一个节点**地在你的画布上长出来。你全程看得见，随时能喊停。
