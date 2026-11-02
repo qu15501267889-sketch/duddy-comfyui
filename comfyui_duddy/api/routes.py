@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import Any, Dict, Optional
 
@@ -28,8 +29,25 @@ P = "/duddy"
 WAIT_FRONTEND_SEC = 12.0
 POLL_SEC = 0.12
 
+#: 是否需要人工审批。
+#:   0（默认）= 全权接管：计划一创建就自动执行，弹窗只是通知 + 停止按钮
+#:   1        = 恢复闸门：必须等用户在弹窗里点「同意」，且 token 才有效
+REQUIRE_APPROVAL = os.environ.get("DUDDY_REQUIRE_APPROVAL", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+#: 自动执行时每步之间的间隔，留出前端动画时间
+AUTO_STEP_DELAY = float(os.environ.get("DUDDY_STEP_DELAY", "0.12"))
+MAX_AUTO_STEPS = 300
+
 # (plan_id, step_index) -> 前端回报
 _pending: Dict[tuple, Dict[str, Any]] = {}
+# 正在自动执行的计划（防止 AI 手动 apply 与后台任务打架）
+_auto_running: set = set()
+_auto_tasks: Dict[str, Any] = {}
 _registered = False
 
 
@@ -64,7 +82,7 @@ def _guard(fn):
         try:
             return await fn(request)
         except PlanError as e:
-            return _err(str(e), e.code, e.kind)
+            return _err(str(e), e.code, e.kind, **e.extra)
         except web.HTTPException:
             raise
         except Exception as e:
@@ -87,6 +105,8 @@ async def ping(request: web.Request) -> web.Response:
             "uptime_s": round(time.time() - state.boot_ts, 1),
             "plans": len(plan_manager.list_recent(limit=200)),
             "clients": len(state.clients),
+            "require_approval": REQUIRE_APPROVAL,
+            "auto_apply": not REQUIRE_APPROVAL,
             "bus": bus.stats(),
         }
     )
@@ -119,8 +139,8 @@ async def capabilities(request: web.Request) -> web.Response:
                 "note",
                 "execute",
             ],
-            "requires_approval": True,
-            "approval_channel": "frontend_modal",
+            "requires_approval": REQUIRE_APPROVAL,
+            "approval_channel": "frontend_modal" if REQUIRE_APPROVAL else "auto",
             "single_step_apply": True,
             "trace": False,
             "logs": False,
@@ -202,6 +222,120 @@ async def canvas_applied(request: web.Request) -> web.Response:
     return _ok({"accepted": True})
 
 
+# ------------------------------------------------------------------ 执行内核
+
+
+async def do_step(
+    plan_id: str,
+    expected_index: Optional[int] = None,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """执行一步。HTTP 路由与后台自动执行共用同一实现，避免两套逻辑分叉。"""
+    plan, idx, step = plan_manager.begin_step(plan_id, expected_index)
+
+    sid = state.target_client(plan.client_id)
+    if not sid:
+        plan_manager.record_result(
+            plan_id, idx, False,
+            {"reason": "no_frontend", "hint": "没有浏览器连接，无法操作画布"},
+        )
+        raise PlanError(
+            "没有前端连接。请先在浏览器打开 ComfyUI 页面（画布必须在线才能建节点）。",
+            409,
+            "no_frontend",
+        )
+
+    key = (plan_id, idx)
+    _pending[key] = {"done": False, "ok": False, "detail": None, "ts": time.time()}
+
+    bus.publish(
+        "duddy.canvas.op",
+        {
+            "plan_id": plan_id,
+            "step_index": idx,
+            "total": len(plan.steps),
+            "op": step,
+            "dry_run": dry_run,
+        },
+        sid=sid,
+    )
+
+    deadline = time.time() + WAIT_FRONTEND_SEC
+    rec = _pending.get(key)
+    while time.time() < deadline:
+        if rec and rec.get("done"):
+            break
+        await asyncio.sleep(POLL_SEC)
+        rec = _pending.get(key)
+    rec = _pending.pop(key, None)
+
+    if not rec or not rec.get("done"):
+        plan_manager.record_result(
+            plan_id, idx, False,
+            {"reason": "frontend_timeout", "hint": f"前端 {WAIT_FRONTEND_SEC:.0f}s 内没有回报"},
+        )
+        raise PlanError(
+            f"前端未在 {WAIT_FRONTEND_SEC:.0f} 秒内确认执行结果。检查浏览器控制台。",
+            504,
+            "frontend_timeout",
+            step_index=idx,
+        )
+
+    updated = plan_manager.record_result(plan_id, idx, bool(rec["ok"]), rec["detail"])
+    return {
+        "step_index": idx,
+        "step": step,
+        "ok": bool(rec["ok"]),
+        "detail": rec["detail"],
+        "cursor": updated.cursor,
+        "step_count": len(updated.steps),
+        "plan_state": updated.state,
+        "remaining": len(updated.steps) - updated.cursor,
+    }
+
+
+async def _auto_apply(plan_id: str) -> None:
+    """后台把整个计划一口气跑完，不需要 AI 在埸、也不需要用户再点任何东西。"""
+    logger.info("[duddy] auto-apply 开始 %s", plan_id)
+    try:
+        for _ in range(MAX_AUTO_STEPS):
+            plan = plan_manager.get(plan_id)
+            if plan.state not in ("approved", "applying"):
+                break
+            if plan.cursor >= len(plan.steps):
+                break
+            try:
+                res = await do_step(plan_id)
+            except PlanError as e:
+                logger.warning("[duddy] auto-apply 停止：%s (%s)", e, e.kind)
+                break
+            if not res["ok"]:
+                logger.warning("[duddy] auto-apply 步骤失败：%s", res["detail"])
+                break
+            await asyncio.sleep(AUTO_STEP_DELAY)
+    except asyncio.CancelledError:
+        logger.info("[duddy] auto-apply 被取消 %s", plan_id)
+        raise
+    except Exception as e:
+        logger.exception("[duddy] auto-apply 崩溃：%s", e)
+    finally:
+        _auto_running.discard(plan_id)
+        _auto_tasks.pop(plan_id, None)
+        logger.info("[duddy] auto-apply 结束 %s", plan_id)
+
+
+def kick_auto(plan_id: str) -> bool:
+    """启动后台自动执行。没有前端连接时返回 False（画布指令无处可去）。"""
+    if plan_id in _auto_running:
+        return True
+    if not state.target_client():
+        logger.warning("[duddy] 没有前端连接，无法自动执行 %s", plan_id)
+        return False
+    _auto_running.add(plan_id)
+    _auto_tasks[plan_id] = asyncio.create_task(_auto_apply(plan_id))
+    return True
+
+
 # ------------------------------------------------------------------ 计划
 
 
@@ -216,14 +350,28 @@ async def plan_create(request: web.Request) -> web.Response:
         notes=body.get("notes") or "",
         client_id=client_id,
     )
+
+    auto_started = False
+    if not REQUIRE_APPROVAL:
+        # 全权接管模式：创建即批准，立刻开跑
+        try:
+            plan_manager.auto_approve(plan.id, by="auto")
+            auto_started = kick_auto(plan.id)
+        except PlanError as e:
+            logger.warning("[duddy] auto approve failed: %s", e)
+
     notice = None
     if not state.alive_clients():
         notice = (
-            "注意：当前没有任何前端连接，审批弹窗发不出去。"
-            "请先在浏览器打开 ComfyUI 页面，否则计划会一直停留在 proposed。"
+            "当前没有任何前端连接，画布指令无处可去。"
+            "请先在浏览器打开 ComfyUI 页面，然后把计划重新提交一次。"
         )
+
+    payload = plan.public()
+    payload["approval_mode"] = "manual" if REQUIRE_APPROVAL else "auto"
+    payload["auto_started"] = auto_started
     # 返回体里绝不带 token
-    return _ok(plan.public(), narration=plan.narration(), notice=notice)
+    return _ok(payload, narration=plan.narration(), notice=notice)
 
 
 @_guard
@@ -250,7 +398,9 @@ async def plan_approve(request: web.Request) -> web.Response:
         )
     by = str(body.get("by") or "ui")
     plan = plan_manager.approve(request.match_info["plan_id"], token, by=by)
-    return _ok(plan.public())
+    # 手动模式下用户点了同意，也应该由后端一口气跑完，不用再等 AI 回来
+    started = kick_auto(plan.id)
+    return _ok(plan.public(), auto_started=started)
 
 
 @_guard
@@ -268,83 +418,26 @@ async def plan_reject(request: web.Request) -> web.Response:
 async def plan_step(request: web.Request) -> web.Response:
     body = await _body(request)
     plan_id = request.match_info["plan_id"]
-    expected = body.get("expected_index")
-
-    plan, idx, step = plan_manager.begin_step(
-        plan_id, None if expected is None else int(expected)
-    )
-
-    sid = state.target_client(plan.client_id)
-    if not sid:
-        plan_manager.record_result(
-            plan_id,
-            idx,
-            False,
-            {"reason": "no_frontend", "hint": "没有浏览器连接，无法操作画布"},
-        )
+    if plan_id in _auto_running:
         return _err(
-            "没有前端连接。请先在浏览器打开 ComfyUI 页面（画布必须在线才能建节点）。",
+            "该计划正在自动执行中，不需要手动触发。要停下来请调 abort。",
             409,
-            "no_frontend",
+            "auto_running",
         )
-
-    key = (plan_id, idx)
-    _pending[key] = {"done": False, "ok": False, "detail": None, "ts": time.time()}
-
-    bus.publish(
-        "duddy.canvas.op",
-        {
-            "plan_id": plan_id,
-            "step_index": idx,
-            "total": len(plan.steps),
-            "op": step,
-            "dry_run": bool(body.get("dry_run")),
-        },
-        sid=sid,
+    expected = body.get("expected_index")
+    result = await do_step(
+        plan_id,
+        None if expected is None else int(expected),
+        bool(body.get("dry_run")),
     )
-
-    deadline = time.time() + WAIT_FRONTEND_SEC
-    rec = _pending.get(key)
-    while time.time() < deadline:
-        if rec and rec.get("done"):
-            break
-        await asyncio.sleep(POLL_SEC)
-        rec = _pending.get(key)
-    rec = _pending.pop(key, None)
-
-    if not rec or not rec.get("done"):
-        plan_manager.record_result(
-            plan_id,
-            idx,
-            False,
-            {"reason": "frontend_timeout", "hint": "前端 12s 内没有回报执行结果"},
-        )
+    if not result["ok"]:
         return _err(
-            "前端未在 12 秒内确认执行结果。检查浏览器控制台是否有报错、页面是否在前台。",
-            504,
-            "frontend_timeout",
-            step_index=idx,
-        )
-
-    updated = plan_manager.record_result(plan_id, idx, bool(rec["ok"]), rec["detail"])
-    payload = {
-        "step_index": idx,
-        "step": step,
-        "ok": bool(rec["ok"]),
-        "detail": rec["detail"],
-        "cursor": updated.cursor,
-        "step_count": len(updated.steps),
-        "plan_state": updated.state,
-        "remaining": len(updated.steps) - updated.cursor,
-    }
-    if not rec["ok"]:
-        return _err(
-            f"第 {idx + 1} 步执行失败：{rec['detail']}",
+            f"第 {result['step_index'] + 1} 步执行失败：{result['detail']}",
             422,
             "step_failed",
-            **payload,
+            **result,
         )
-    return _ok(payload)
+    return _ok(result)
 
 
 @_guard
@@ -355,8 +448,13 @@ async def plan_retry(request: web.Request) -> web.Response:
 @_guard
 async def plan_abort(request: web.Request) -> web.Response:
     body = await _body(request)
+    plan_id = request.match_info["plan_id"]
+    task = _auto_tasks.pop(plan_id, None)
+    if task is not None:
+        task.cancel()
+        _auto_running.discard(plan_id)
     return _ok(
-        plan_manager.abort(request.match_info["plan_id"], str(body.get("reason") or "")).public()
+        plan_manager.abort(plan_id, str(body.get("reason") or "")).public()
     )
 
 

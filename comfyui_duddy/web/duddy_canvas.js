@@ -27,6 +27,7 @@ const D = {
   lastSeq: 0,
   pollMode: false,
   pollTimer: null,
+  approvalMode: "auto", // auto = 全权接管；manual = 需要点同意
 };
 
 /* ------------------------------------------------------ 事件分发基础设施
@@ -468,8 +469,14 @@ function showPlan(evt) {
   const steps = plan.steps || [];
   const creates = steps.filter((s) => s.kind === "create_node").length;
   const connects = steps.filter((s) => s.kind === "connect").length;
+  // 全权接管模式：不需要点任何东西，卡片只作播报 + 刹车
+  const isAuto =
+    D.approvalMode === "auto" ||
+    plan.state === "approved" ||
+    plan.state === "applying" ||
+    plan.state === "done";
 
-  D.active = { plan, token, approved: false };
+  D.active = { plan, token, approved: isAuto };
 
   const rows = steps
     .map(
@@ -487,7 +494,9 @@ function showPlan(evt) {
   el.innerHTML = `
     <div style="padding:12px 14px;border-bottom:1px solid #3a3a44;display:flex;align-items:flex-start;gap:8px">
       <div style="flex:1">
-        <div style="font-size:11px;letter-spacing:.06em;color:#4a9eff;text-transform:uppercase">等待你的批准</div>
+        <div style="font-size:11px;letter-spacing:.06em;color:#4a9eff;text-transform:uppercase">${
+          isAuto ? "正在自动执行" : "等待你的批准"
+        }</div>
         <div style="font-size:14.5px;font-weight:600;margin-top:3px">${esc(plan.title)}</div>
         <div style="color:#9a9aa6;margin-top:3px;font-size:12px">${esc(plan.summary)}</div>
       </div>
@@ -501,34 +510,57 @@ function showPlan(evt) {
       </div>
       <div style="max-height:38vh;overflow:auto;border-top:1px solid #2a2a32">${rows}</div>
       ${plan.notes ? `<div style="margin-top:8px;color:#8a8a96;font-size:11.5px">${esc(plan.notes)}</div>` : ""}
-      <div id="duddy-progress" style="display:none;margin-top:10px">
+      <div id="duddy-progress" style="margin-top:10px;${isAuto ? "" : "display:none"}">
         <div style="height:4px;background:#2a2a32;border-radius:2px;overflow:hidden">
           <div id="duddy-bar" style="height:100%;width:0%;background:#4a9eff;transition:width .25s"></div>
         </div>
-        <div id="duddy-progress-text" style="color:#8a8a96;font-size:11.5px;margin-top:5px"></div>
+        <div id="duddy-progress-text" style="color:#8a8a96;font-size:11.5px;margin-top:5px">${
+          isAuto ? "已开始，正在逐步执行…" : ""
+        }</div>
       </div>
     </div>
     <div id="duddy-actions" style="padding:10px 14px;border-top:1px solid #3a3a44;display:flex;flex-direction:column;gap:8px">
       <div id="duddy-approve-hint" style="color:#ff9b9b;font-size:11.5px;line-height:1.4"></div>
       <div style="display:flex;gap:8px;justify-content:flex-end">
-        <button id="duddy-reject" style="padding:7px 14px;border-radius:7px;background:#2a2a32;color:#c8c8d0;border:1px solid #3a3a44;cursor:pointer;font-size:12.5px">拒绝</button>
-        <button id="duddy-approve" style="padding:7px 16px;border-radius:7px;background:#2f6fed;color:#fff;border:none;cursor:pointer;font-size:12.5px;font-weight:600">同意并执行</button>
+        ${
+          isAuto
+            ? `<button id="duddy-abort" style="padding:7px 16px;border-radius:7px;background:#2a2a32;color:#ff9b9b;border:1px solid #a33;cursor:pointer;font-size:12.5px">停止</button>`
+            : `<button id="duddy-reject" style="padding:7px 14px;border-radius:7px;background:#2a2a32;color:#c8c8d0;border:1px solid #3a3a44;cursor:pointer;font-size:12.5px">拒绝</button>
+               <button id="duddy-approve" style="padding:7px 16px;border-radius:7px;background:#2f6fed;color:#fff;border:none;cursor:pointer;font-size:12.5px;font-weight:600">同意并执行</button>`
+        }
       </div>
     </div>
   `;
   el.style.display = "flex";
 
   el.querySelector("#duddy-x").onclick = closeModal;
-  el.querySelector("#duddy-reject").onclick = async () => {
-    await post(`/duddy/plan/${plan.plan_id}/reject`, {
-      reason: "用户在弹窗中点了拒绝",
-      token: (D.active && D.active.token) || token,
-      client_id: D.clientId,
-    });
-    setPill("已拒绝，AI 不会动你的画布", 2200);
-    closeModal();
-  };
-  el.querySelector("#duddy-approve").onclick = async () => {
+
+  const abortBtn = el.querySelector("#duddy-abort");
+  if (abortBtn) {
+    abortBtn.onclick = async () => {
+      abortBtn.disabled = true;
+      abortBtn.textContent = "停止中…";
+      await post(`/duddy/plan/${plan.plan_id}/abort`, { reason: "用户点了停止" });
+      setPill("已停止，剩下的步骤不会再执行", 2600);
+      closeModal();
+    };
+  }
+
+  const rejectBtn = el.querySelector("#duddy-reject");
+  if (rejectBtn) {
+    rejectBtn.onclick = async () => {
+      await post(`/duddy/plan/${plan.plan_id}/reject`, {
+        reason: "用户在弹窗中点了拒绝",
+        token: (D.active && D.active.token) || token,
+        client_id: D.clientId,
+      });
+      setPill("已拒绝，AI 不会动你的画布", 2200);
+      closeModal();
+    };
+  }
+
+  const approveBtn = el.querySelector("#duddy-approve");
+  if (approveBtn) approveBtn.onclick = async () => {
     const btn = el.querySelector("#duddy-approve");
     const hint = el.querySelector("#duddy-approve-hint");
     btn.disabled = true;
@@ -673,13 +705,24 @@ app.registerExtension({
     setInterval(pushCanvasState, 8000);
     setTimeout(pushCanvasState, 2500);
 
-    // ④ 最后才报到：hello 会让后端把未决计划重推一遍
+    // ④ 问后端当前是哪种模式，决定卡片是「等你批准」还是「直接开跑」
+    try {
+      const r = await api.fetchApi("/duddy/ping");
+      const j = await r.json();
+      const need = j && j.data && j.data.require_approval;
+      D.approvalMode = need ? "manual" : "auto";
+      LOG("审批模式:", D.approvalMode);
+    } catch (e) {
+      WARN("读取审批模式失败，按 auto 处理", e);
+    }
+
+    // ⑤ 报到：hello 会让后端把未决计划重推一遍
     await sayHello("setup");
 
-    // ⑤ 报到完把 seq 对齐，避免轮询把刷新前的历史 op 重放出来
+    // ⑥ 报到完把 seq 对齐，避免轮询把刷新前的历史 op 重放出来
     await alignSeq();
 
-    // ⑥ 传输层兜底
+    // ⑦ 传输层兜底
     if (wsOk) {
       startPolling(2000); // 慢兜底：ws 丢包 2 秒内也能补上
     } else {

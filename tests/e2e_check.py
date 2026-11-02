@@ -42,6 +42,13 @@ async def main() -> int:
     print(f"{B}端到端验证{X}  假前端 clientId={CID}")
 
     async with aiohttp.ClientSession() as s:
+        # 0) 先问模式
+        async with s.get(f"{BASE}/duddy/ping") as r:
+            ping = await r.json()
+        need_approval = bool(ping.get("data", {}).get("require_approval"))
+        mode = "manual（需要批准）" if need_approval else "auto（全权接管）"
+        print(f"  模式: {mode}")
+
         # 1) 报到
         async with s.post(f"{BASE}/duddy/client/hello", json={"client_id": CID}) as r:
             if r.status != 200:
@@ -96,9 +103,10 @@ async def main() -> int:
             plan_body = {
                 "title": "端到端自检",
                 "summary": "由 e2e_check.py 自动批准，验证闸门与逐步执行",
+                "client_id": CID,  # 绑死假前端，别往用户画布上乱建
                 "steps": [
-                    {"kind": "create_node", "title": "A", "args": {"type": "Note", "ref": "a"}},
-                    {"kind": "create_node", "title": "B", "args": {"type": "Note", "ref": "b"}},
+                    {"kind": "create_node", "title": "A", "args": {"type": "Note", "ref": "a", "pos": [2400, 1800]}},
+                    {"kind": "create_node", "title": "B", "args": {"type": "Note", "ref": "b", "pos": [2700, 1800]}},
                     {
                         "kind": "connect",
                         "title": "A→B",
@@ -120,57 +128,63 @@ async def main() -> int:
             else:
                 ok("HTTP 响应不含 token")
 
-            # 3) 等 ws 拿到 token
-            for _ in range(30):
-                if box["token"]:
-                    break
-                await asyncio.sleep(0.1)
-            if not box["token"]:
-                bad("ws 没收到 token，弹窗链路断了")
-                task.cancel()
-                return 1
-            ok("token 已通过 ws 定向下发")
+            if need_approval:
+                # 3) 等 ws 拿到 token
+                for _ in range(30):
+                    if box["token"]:
+                        break
+                    await asyncio.sleep(0.1)
+                if not box["token"]:
+                    bad("ws 没收到 token，弹窗链路断了")
+                    task.cancel()
+                    return 1
+                ok("token 已通过 ws 定向下发")
 
-            # 4) 未批准先试一次，必须被拦
-            async with s.post(f"{BASE}/duddy/plan/{pid}/step", json={}) as r:
-                st = r.status
-            if st == 403:
-                ok("未批准时 apply 被 403 拦下")
-            else:
-                bad(f"未批准竟然没拦住！HTTP {st}")
-                fails.append("gate")
+                # 4) 未批准先试一次，必须被拦
+                async with s.post(f"{BASE}/duddy/plan/{pid}/step", json={}) as r:
+                    st = r.status
+                if st == 403:
+                    ok("未批准时 apply 被 403 拦下")
+                else:
+                    bad(f"未批准竟然没拦住！HTTP {st}")
+                    fails.append("gate")
 
-            # 5) 批准
-            async with s.post(
-                f"{BASE}/duddy/plan/{pid}/approve",
-                json={"token": box["token"], "by": "e2e", "client_id": CID},
-            ) as r:
-                body = await r.json()
-            if not body.get("ok"):
-                bad(f"批准失败: {body}")
-                task.cancel()
-                return 1
-            ok("批准成功 → state=approved")
-
-            # 6) 逐步骤执行
-            for i in range(3):
+                # 5) 批准 → 后端应接手自动执行
                 async with s.post(
-                    f"{BASE}/duddy/plan/{pid}/step", json={"expected_index": i}
+                    f"{BASE}/duddy/plan/{pid}/approve",
+                    json={"token": box["token"], "by": "e2e", "client_id": CID},
                 ) as r:
                     body = await r.json()
-                    code = r.status
-                if code == 200 and body.get("ok"):
-                    d = body["data"]
-                    ok(
-                        f"第 {d['step_index'] + 1} 步 {d['step']['kind']} 完成 · "
-                        f"剩余 {d['remaining']} · plan={d['plan_state']}"
-                    )
-                else:
-                    bad(f"第 {i + 1} 步失败 HTTP {code}: {body}")
-                    fails.append("step")
+                if not body.get("ok"):
+                    bad(f"批准失败: {body}")
+                    task.cancel()
+                    return 1
+                ok(f"批准成功 → auto_started={body.get('auto_started')}")
+            else:
+                ok(f"免审批模式，auto_started={data['data'].get('auto_started')}")
+
+            # 6) 等后台一口气跑完（两种模式现在都由 auto_apply 推进）
+            final = {}
+            for _ in range(80):
+                await asyncio.sleep(0.4)
+                async with s.get(f"{BASE}/duddy/plan/{pid}") as r:
+                    final = (await r.json())["data"]
+                if final.get("state") in ("done", "failed", "aborted"):
                     break
 
-            # 7) 终态
+            if final.get("state") == "done" and final.get("cursor") == 3:
+                ok(f"自动执行完成：state=done · cursor=3/3")
+            else:
+                bad(f"终态异常：state={final.get('state')} cursor={final.get('cursor')}")
+                fails.append("final")
+
+            # 7) 重复执行检测：假前端收到几次 op 就回报几次
+            ok(f"前端回报 {box['applied']} 次（应为 3）")
+            if box["applied"] != 3:
+                bad("步骤被重复执行了")
+                fails.append("dup_exec")
+
+            # 8) 终态
             async with s.get(f"{BASE}/duddy/plan/{pid}") as r:
                 final = (await r.json())["data"]
             if final["state"] == "done" and final["cursor"] == 3:

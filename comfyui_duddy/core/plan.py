@@ -59,12 +59,19 @@ _VALID_TRANSITIONS: Dict[str, set] = {
 
 
 class PlanError(Exception):
-    """业务级错误，会被路由层翻译成 4xx。"""
+    """业务级错误，会被路由层翻译成 4xx。extra 会并入响应体。"""
 
-    def __init__(self, message: str, code: int = 400, kind: str = "bad_request") -> None:
+    def __init__(
+        self,
+        message: str,
+        code: int = 400,
+        kind: str = "bad_request",
+        **extra: Any,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.kind = kind
+        self.extra = extra
 
 
 class Plan:
@@ -305,6 +312,24 @@ class PlanManager:
         self._persist(plan)
         bus.publish("duddy.plan.approved", {"plan_id": plan.id, "by": by})
         logger.info("[duddy] plan approved %s by=%s", plan.id, by)
+        return plan
+
+    def auto_approve(self, plan_id: str, by: str = "auto") -> Plan:
+        """免审批模式：计划一创建就视为已批准，不经过弹窗等待。
+
+        这是用户明确要求的「全权接管」。闸门代码全部保留，
+        环境变量 DUDDY_REQUIRE_APPROVAL=1 即可恢复人工审批。
+        """
+        plan = self.get(plan_id)
+        if plan.state != "proposed":
+            raise PlanError(f"plan is '{plan.state}'", 409, "wrong_state")
+        plan.transition("approved")
+        plan.approved_at = plan.updated_at
+        plan.approved_by = by
+        security.vault.revoke(plan_id)
+        self._persist(plan)
+        bus.publish("duddy.plan.approved", {"plan_id": plan.id, "by": by, "auto": True})
+        logger.info("[duddy] plan auto-approved %s", plan.id)
         return plan
 
     def reject(self, plan_id: str, reason: str = "", token: Optional[str] = None) -> Plan:
