@@ -257,6 +257,23 @@ WebSocket 事件（ComfyUI 原生 `/ws`）：
 
 ---
 
+
+## 已知陷阱：执行进度需要 client_id
+
+ComfyUI 的 `execution.py` 里是这样发执行事件的：
+
+```python
+if server.client_id is not None:
+    server.send_sync("executing", {...}, server.client_id)
+```
+
+**没有 client_id 时它什么都不发。** 这意味着：
+
+- 浏览器点 Queue → `api.queuePrompt` 自动带 clientId → 进度正常
+- 脚本直接 `POST /prompt` → 必须自己带 `"client_id": "xxx"`，否则 `duddy_run_status` 永远是 idle
+
+不是 bug，是 ComfyUI 的设计（避免无谓广播）。写在这里免得下次又怀疑进度模块坏了。
+
 ## 排障
 
 **`/duddy/ping` 连不上**
