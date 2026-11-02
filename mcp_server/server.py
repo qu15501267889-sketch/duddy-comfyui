@@ -572,12 +572,17 @@ def tool_precheck_plan(args: Dict[str, Any]) -> Dict[str, Any]:
     if status != 200 or not data.get("ok"):
         return _txt(data, is_error=True)
     d = data["data"]
+    passed = bool(d.get("passed"))
     return _txt(
         {
-            "passed": d.get("passed"),
+            "passed": passed,
             "errors": d.get("errors") or [],
             "warnings": d.get("warnings") or [],
-            "next": "通过就可以去 plan_workflow；有 errors 先改，别硬上。",
+            "next": (
+                "通过，可以去 plan_workflow 了。"
+                if passed
+                else "不通过。必须先把 errors 改掉，不要提交——硬上会做到一半失败。"
+            ),
         }
     )
 

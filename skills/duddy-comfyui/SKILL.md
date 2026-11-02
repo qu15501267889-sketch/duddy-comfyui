@@ -169,7 +169,159 @@ auto 模式下**返回时通常已经跑完了**（`state=done` 或 `failed`）�
 
 ---
 
-## 四、布局规范（别把画布炸了）
+## 四、六种常见任务的搭法
+
+用户说"搭个 XX"，先对号入座，别从零想。
+
+### ① 文生图（最小链路）
+
+```
+UnetLoader / UnetLoaderGGUF      → model
+CLIPLoader (type=qwen_image)     → clip
+VAELoader                        → vae
+        ↓ 三者都接
+TextEncodeQwenImage21  ['', '', '1024']
+        ↓ positive / negative / latent
+KSampler  [steps=25, cfg=1, euler, simple, denoise=1]
+        ↓
+VAEDecode → SaveImage
+```
+
+**文生图必须给 resolution 或 EmptyLatent 的宽高**，否则报错。
+
+### ② 图生图 / 编辑
+
+同上，但 `TextEncodeQwenImage21` 的 `image_1` 接 `LoadImage`。
+
+**原图走 image_1 进编码器，不进 latent。** denoise 保持 1。
+要"少改"就把 Restore LoRA 挂上（强度 1.0，糊图用 0.5）。
+
+### ③ 放大 / 超分（分块重绘）
+
+```
+LoadImage → TiledUpscale(目标MP=4)  → [图块, 掩码]
+        ↓
+TextEncodeQwenImage21（每块 + 提示词）
+        ↓
+KSampler(8或25步) → VAEDecode → TiledUpscaleStitch → SaveImage
+```
+
+**超过 2 MP 必须分块**，重叠带 128 px 消缝。
+提示词用现成的：`Restore the photo: remove blur, noise and compression artifacts...`
+
+### ④ 扩图
+
+```
+LoadImagePad（四边扩展，填充 #808080 中灰）
+        ↓
+[可选] TextGenerate 给原图写描述 → StringConcatenate("指令" + " Scene: " + 描述)
+        ↓
+TextEncodeQwenImage21(resolution=0) → KSampler → VAEDecode
+        ↓
+StitchInpaint（把原图像素贴回）→ SaveImage
+```
+
+**填充色必须用中灰 `#808080`**，纯白纯黑会污染生成区。
+
+### ⑤ 换装 / 换人
+
+```
+两个 LoraLoader：body_swap / head_swap
+        ↓
+PrimitiveBoolean + ComfySwitchNode 二选一
+        ↓
+TextEncodeQwenImage21（image_1=场景图, image_2=角色图）
+```
+
+**两个 LoRA 不能同时挂**，用开关切。
+提示词用 `<image1>` / `<image2>` 明确指代。
+
+### ⑥ 角色设定图（多角度一致）
+
+```
+同一角色挂 consistency LoRA
+        ↓
+一张图 → 多个 SaveImage（不同 seed/角度）
+        ↓ 或
+一次生成多视角拼图：提示词写 "Character reference sheet, same person three times side by side"
+```
+
+**核心是 consistency LoRA + 固定 seed**，换 seed 就换脸。
+
+---
+
+## 五、错误决策树
+
+不要看到错误就停，先走一遍判断。
+
+### 跑不起来
+
+```
+报 unknown_node_type
+  → duddy_search_nodes 搜关键词
+  → 找到相似名就换；找不到就是没装插件 → 告诉用户装什么
+
+报 Required input is missing
+  → 那个节点的必需输入没接
+  → duddy_node_info 查 required 列表，对照连线看缺哪个
+
+报 connect_rejected
+  → 类型不匹配
+  → 回报里有 from.type / to.type，摆给用户看
+```
+
+### 跑起来但慢得离谱
+
+```
+duddy_get_logs(contains="offloaded")
+  → 有 offloaded 且超过总量一半
+      → 是显存不足，不是算力问题
+      → 让用户降分辨率（4 MP → 1 MP 约快 4 倍）
+      → 或换更小的量化（Q8 → Q6/Q4）
+  → 没有 offloaded
+      → 看是不是 steps 太高（Qwen 25 步够，40 步是官方 pipeline）
+```
+
+### 出图不对
+
+```
+画面糊 / 发灰
+  → denoise 是不是被调低了？改回 1
+  → 是不是空 latent + 低 denoise？改回 1
+
+边缘过锐 / 色彩发脏
+  → cfg 是不是 > 3？改回 1
+
+主体没变（人脸没换、衣服没换）
+  → image_1 连上了吗？duddy_canvas_state 看连线
+  → LoRA 挂上了吗？strength 是不是 0？
+  → 提示词里有没有明确说"把 <image2> 的衣服换到 <image1> 的人身上"
+
+加了负向提示词但没效果
+  → 正常，cfg=1 下负向词不生效
+  → 改写成正向陈述
+
+黑图 / 花屏
+  → fp16 溢出，dequant_dtype 改 float32
+  → 或画面尺寸太大爆显存
+```
+
+### 卡住不动
+
+```
+duddy_run_status
+  → status=running 但 step 长时间不变
+      → 可能在做 CPU offload 搬运，正常但极慢
+      → 看日志有没有 "loaded partially"
+  → status=stale（90 秒无事件）
+      → 任务已死，duddy_abort_plan 清掉重来
+  → 队列里有 pending
+      → 前面还有任务，等
+```
+
+---
+
+## 六、布局规范（别把画布炸了）
 
 ```
 左侧竖排    模型加载（UNET / CLIP / VAE / LoRA）
@@ -186,7 +338,7 @@ auto 模式下**返回时通常已经跑完了**（`state=done` 或 `failed`）�
 
 ---
 
-## 五、代跑图
+## 七、代跑图
 
 ```
 {"kind":"execute","title":"提交队列","args":{}}
@@ -198,7 +350,7 @@ auto 模式下**返回时通常已经跑完了**（`state=done` 或 `failed`）�
 
 ---
 
-## 六、工具总表（16 个）
+## 八、工具总表（16 个）
 
 **诊断**
 | 工具 | 用途 |
@@ -234,7 +386,7 @@ auto 模式下**返回时通常已经跑完了**（`state=done` 或 `failed`）�
 
 ---
 
-## 七、出问题的时候
+## 九、出问题的时候
 
 **先看日志，别猜。**
 
@@ -279,7 +431,7 @@ loaded partially; 1657 MB usable, 1503 MB loaded, 5864 MB offloaded
 
 ---
 
-## 八、中止
+## 十、中止
 
 用户说"停""算了""不对"——立刻：
 
