@@ -24,7 +24,84 @@ const D = {
   active: null,
   busy: false,
   lastCanvasPush: 0,
+  lastSeq: 0,
+  pollMode: false,
+  pollTimer: null,
 };
+
+/* ------------------------------------------------------ 事件分发基础设施
+
+ComfyUI 前端 1.5x 的 api.js 收到 ws 消息时这样判断：
+
+    if (this._registered.has(type)) dispatchEvent(...)
+    else if (!reportedUnknownMessageTypes.has(type)) throw Error('Unknown message type')
+
+而 `_registered` 只由 addCustomEventListener() 填充，
+addEventListener() 不会加。用错方法的结果是：第一次抛错并记入
+reportedUnknownMessageTypes，之后同类型消息被**静默丢弃**——
+表现就是"接不上、没反应、也不报错"。
+
+所以必须用 api.addCustomEventListener。拿不到就退化成 HTTP 轮询。
+*/
+
+const KNOWN_EVENTS = [
+  "duddy.plan.proposed",
+  "duddy.plan.approved",
+  "duddy.plan.rejected",
+  "duddy.plan.done",
+  "duddy.plan.failed",
+  "duddy.plan.aborted",
+  "duddy.plan.expired",
+  "duddy.canvas.op",
+  "duddy.canvas.applied",
+  "duddy.run.progress",
+  "duddy.log.line",
+  "duddy.fs.change",
+];
+
+const handlers = new Map();
+
+function on(type, fn) {
+  if (!handlers.has(type)) handlers.set(type, []);
+  handlers.get(type).push(fn);
+}
+
+function dispatch(type, data, seq) {
+  if (seq) {
+    if (seq <= D.lastSeq) return; // 去重：ws 与轮询可能都收到同一条
+    D.lastSeq = seq;
+  }
+  const list = handlers.get(type);
+  if (!list || !list.length) return;
+  for (const fn of list) {
+    try {
+      fn(data || {});
+    } catch (e) {
+      WARN("handler error", type, e);
+    }
+  }
+}
+
+function attachWsEvents() {
+  if (typeof api.addCustomEventListener !== "function") {
+    WARN("api.addCustomEventListener 不存在，无法接收自定义 ws 事件");
+    return false;
+  }
+  let ok = 0;
+  KNOWN_EVENTS.forEach((t) => {
+    try {
+      api.addCustomEventListener(t, (e) => {
+        const d = payloadOf(e);
+        dispatch(t, d, d && d.seq);
+      });
+      ok += 1;
+    } catch (err) {
+      WARN("注册自定义事件失败", t, err);
+    }
+  });
+  LOG(`已注册 ${ok}/${KNOWN_EVENTS.length} 个自定义事件`);
+  return ok > 0;
+}
 
 /* ------------------------------------------------------------------ 工具 */
 
@@ -492,43 +569,56 @@ async function sayHello(reason) {
   return r;
 }
 
+function startPolling(intervalMs) {
+  if (D.pollTimer) return;
+  D.pollMode = true;
+  const iv = intervalMs || 500;
+  LOG(`HTTP 事件轮询启动（${iv}ms）`);
+  D.pollTimer = setInterval(async () => {
+    try {
+      const r = await api.fetchApi(`/duddy/events?since=${D.lastSeq}&limit=50`);
+      const j = await r.json();
+      for (const evt of j.data || []) {
+        dispatch(evt.type, evt.data, evt.seq);
+      }
+    } catch (e) {
+      /* 网络抖动无所谓，下一轮再试 */
+    }
+  }, iv);
+}
+
 app.registerExtension({
   name: "duddy.control",
   async setup() {
     D.clientId = api.clientId || null;
     LOG("extension setup, clientId=", D.clientId);
 
-    await sayHello("setup");
+    // ① 先挂传输层（必须用 addCustomEventListener）
+    const wsOk = attachWsEvents();
 
-    api.addEventListener("duddy.plan.proposed", (e) => {
-      const d = payloadOf(e);
+    // ② 业务处理与传输方式解耦，先全部注册好
+    on("duddy.plan.proposed", (d) => {
       LOG("plan proposed", d.plan && d.plan.plan_id);
-      if (D.active && !D.active.approved) {
-        D.queue.push(d);
-      } else {
-        showPlan(d);
-      }
+      if (D.active && !D.active.approved) D.queue.push(d);
+      else showPlan(d);
     });
-
-    api.addEventListener("duddy.plan.approved", (e) => {
-      LOG("plan approved", payloadOf(e));
-      setPill("AI 已获授权，开始动手", 1800);
-    });
-
-    api.addEventListener("duddy.plan.rejected", () => {
-      setPill("计划已拒绝", 1800);
-    });
-
-    api.addEventListener("duddy.canvas.op", (e) => {
-      const d = payloadOf(e);
+    on("duddy.plan.approved", () => setPill("AI 已获授权，开始动手", 1800));
+    on("duddy.plan.rejected", () => setPill("计划已拒绝", 1800));
+    on("duddy.canvas.op", (d) => {
       LOG("op received", d.step_index, d.op && d.op.kind);
       runStep(d);
     });
+    on("duddy.plan.done", () => setPill("计划执行完毕 ✓", 2600));
+    on("duddy.plan.failed", () => setPill("计划执行失败", 3200, true));
 
-    api.addEventListener("duddy.plan.done", () => setPill("计划执行完毕 ✓", 2600));
+    // ③ 挂传输层：ws 已在 attachWsEvents 里注册，这里只决定轮询节奏
+    if (wsOk) {
+      startPolling(2000); // 慢兜底：ws 丢包 2 秒内也能补上
+    } else {
+      startPolling(500); // ws 不可用，靠轮询扛
+    }
 
-    // ComfyUI 重启 / 断线重连：setup 不会重跑，但连接已经是新的一条了，
-    // 必须主动报到一次，否则后端还以为前端不在线。
+    // ComfyUI 重启后 ws 会重连，但 setup() 不会重跑 —— 必须主动重新报到
     api.addEventListener("reconnected", () => {
       LOG("ws reconnected — 重新报到");
       sayHello("reconnected");
@@ -539,6 +629,9 @@ app.registerExtension({
 
     setInterval(pushCanvasState, 8000);
     setTimeout(pushCanvasState, 2500);
+
+    // ④ 最后才报到：hello 会让后端把未决计划重推一遍
+    await sayHello("setup");
   },
 
   async nodeCreated(node) {

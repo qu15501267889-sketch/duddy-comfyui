@@ -6,6 +6,10 @@ import threading
 import time
 from typing import Any, Dict, Optional
 
+#: 超过这么久没动静的客户端视为已断开。
+#: 浏览器关掉标签页时 ComfyUI 不会通知插件，只能靠活跃度判断。
+CLIENT_TTL_SEC = 90
+
 
 class DuddYState:
     def __init__(self) -> None:
@@ -29,20 +33,47 @@ class DuddYState:
             rec["last_seen"] = round(time.time(), 3)
             self.clients[client_id] = rec
             self.last_client_id = client_id
+            self._gc_locked()
             return rec
 
-    def touch(self, client_id: str) -> None:
+    def touch(self, client_id: Optional[str]) -> None:
+        if not client_id:
+            return
         with self._lock:
             if client_id in self.clients:
                 self.clients[client_id]["last_seen"] = round(time.time(), 3)
 
-    def target_client(self, explicit: Optional[str] = None) -> Optional[str]:
-        """决定画布指令发给谁。单人场景下取最近活跃的那个。"""
+    def _gc_locked(self) -> int:
+        now = time.time()
+        dead = [
+            cid
+            for cid, rec in self.clients.items()
+            if now - float(rec.get("last_seen") or 0) > CLIENT_TTL_SEC
+        ]
+        for cid in dead:
+            self.clients.pop(cid, None)
+            if self.last_client_id == cid:
+                self.last_client_id = None
+        return len(dead)
+
+    def alive_clients(self) -> Dict[str, Dict[str, Any]]:
         with self._lock:
+            self._gc_locked()
+            return dict(self.clients)
+
+    def target_client(self, explicit: Optional[str] = None) -> Optional[str]:
+        """决定画布指令发给谁：优先显式指定，否则取最近活跃的那个活客户端。"""
+        with self._lock:
+            self._gc_locked()
             if explicit and explicit in self.clients:
                 return explicit
-            if self.last_client_id:
-                return self.last_client_id
+            alive = sorted(
+                self.clients.items(),
+                key=lambda kv: float(kv[1].get("last_seen") or 0),
+                reverse=True,
+            )
+            if alive:
+                return alive[0][0]
             return None
 
     # ------------------------------------------------------------ 画布快照
@@ -79,10 +110,13 @@ class DuddYState:
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
+            self._gc_locked()
             return {
                 "uptime_s": round(time.time() - self.boot_ts, 1),
                 "clients": list(self.clients.keys()),
                 "last_client_id": self.last_client_id,
+                "target_client": self.target_client(),
+                "client_ttl_s": CLIENT_TTL_SEC,
                 "canvas": self.canvas_summary(),
                 "run": self.run,
                 "modules": dict(self.modules),

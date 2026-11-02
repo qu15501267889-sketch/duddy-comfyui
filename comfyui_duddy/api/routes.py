@@ -168,7 +168,9 @@ async def canvas_state_post(request: web.Request) -> web.Response:
     graph = body.get("graph") or {}
     if not isinstance(graph, dict):
         return _err("graph must be an object", 400, "bad_request")
-    state.set_canvas(graph, reporter=body.get("client_id"))
+    cid = body.get("client_id")
+    state.touch(cid)  # 上报本身就是心跳
+    state.set_canvas(graph, reporter=cid)
     return _ok(state.canvas_summary())
 
 
@@ -215,7 +217,7 @@ async def plan_create(request: web.Request) -> web.Response:
         client_id=client_id,
     )
     notice = None
-    if not state.clients:
+    if not state.alive_clients():
         notice = (
             "注意：当前没有任何前端连接，审批弹窗发不出去。"
             "请先在浏览器打开 ComfyUI 页面，否则计划会一直停留在 proposed。"
