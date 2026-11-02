@@ -176,26 +176,44 @@ class Trace:
         return None
 
     def _estimate_eta(self) -> Optional[float]:
+        """剩余时间估算。
+
+        优先用「当前节点内的步数进度」，这是最准的：
+        8 秒/步、走完 12/20 步 → 还剩 8×8=64 秒。
+        之前的实现要求「至少完成一个节点」才给数，导致第一个节点全程是 None，
+        而那恰恰是用户最想知道剩余时间的时候。
+        """
         if not self.run:
             return None
-        done = len(self.run["completed"])
-        if done == 0:
+
+        st = int(self.run.get("step") or 0)
+        tot = int(self.run.get("total_steps") or 0)
+        node = self.run.get("current_node")
+        started = self._node_started.get(str(node)) if node is not None else None
+
+        graph = state.canvas_graph() or {}
+        total_nodes = len(graph.get("nodes") or [])
+        done_nodes = len(self.run.get("completed") or [])
+
+        if st > 0 and tot > 0 and started:
+            spent_in_node = time.time() - started
+            per_step = spent_in_node / st
+            remain_in_node = per_step * (tot - st)
+            # 后续还有多少节点没法精确知道，用已完成节点的平均耗时粗估
+            tail = 0.0
+            if done_nodes > 0 and total_nodes > done_nodes + 1:
+                avg_per_node = (time.time() - self.run["started_at"]) / done_nodes
+                tail = avg_per_node * (total_nodes - done_nodes - 1)
+            return round(remain_in_node + tail, 1)
+
+        # 退化路径：没有步数信息时，用已完成节点的平均耗时
+        if done_nodes == 0:
             return None
         elapsed = time.time() - self.run["started_at"]
-        per = elapsed / done
-        g = state.canvas_graph() or {}
-        total = len(g.get("nodes") or [])
-        if total <= done:
-            # 退化成用当前节点的步数估
-            if self.run["total_steps"] and self.run["step"]:
-                per_step = 0.0
-                node = self.run.get("current_node")
-                if node and node in self._node_started:
-                    spent = time.time() - self._node_started[node]
-                    per_step = spent / max(self.run["step"], 1)
-                return round(per_step * max(self.run["total_steps"] - self.run["step"], 0), 1)
-            return None
-        return round(per * (total - done - 1), 1)
+        per_node = elapsed / done_nodes
+        if total_nodes > done_nodes:
+            return round(per_node * (total_nodes - done_nodes - 1), 1)
+        return None
 
     def _summary(self) -> Dict[str, Any]:
         if not self.run:
@@ -218,8 +236,12 @@ class Trace:
         with self._lock:
             if self.run is None:
                 return {"status": "idle", "hint": "还没有执行过任何任务"}
-            if self.run["status"] == "running" and time.time() - self._last_event_at > IDLE_TIMEOUT:
-                self.run["status"] = "stale"
+            if self.run["status"] == "running":
+                if time.time() - self._last_event_at > IDLE_TIMEOUT:
+                    self.run["status"] = "stale"
+                else:
+                    # 查询时现算，保证 ETA 和耗时是最新的（事件之间有间隔）
+                    self.run["eta_s"] = self._estimate_eta()
             return self._summary()
 
 
