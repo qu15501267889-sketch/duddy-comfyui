@@ -101,6 +101,7 @@ class Plan:
         self.finished_at: Optional[float] = None
         self.reject_reason: Optional[str] = None
         self.error: Optional[str] = None
+        self.warnings: List[str] = []
 
     # ----------------------------------------------------------------- 视图
     def public(self) -> Dict[str, Any]:
@@ -122,6 +123,7 @@ class Plan:
             "finished_at": self.finished_at,
             "reject_reason": self.reject_reason,
             "error": self.error,
+            "warnings": self.warnings,
             "can_apply": self.state in ("approved", "applying"),
         }
 
@@ -220,8 +222,26 @@ class PlanManager:
         steps: Any,
         notes: str = "",
         client_id: Optional[str] = None,
+        skip_precheck: bool = False,
     ) -> Tuple[Plan, str]:
         cleaned = _validate_steps(steps)
+
+        warnings: List[str] = []
+        if not skip_precheck:
+            from ..modules.registry import precheck
+
+            report = precheck(cleaned)
+            warnings = report["warnings"]
+            if report["errors"]:
+                raise PlanError(
+                    "计划预检未通过（在这台机器上跑不通）：\n  - "
+                    + "\n  - ".join(report["errors"][:8]),
+                    400,
+                    "precheck_failed",
+                    issues=report["errors"],
+                    warnings=report["warnings"],
+                )
+
         plan_id = security.new_plan_id()
         plan = Plan(
             plan_id=plan_id,
@@ -231,6 +251,7 @@ class PlanManager:
             notes=str(notes or "")[:800],
             client_id=client_id,
         )
+        plan.warnings = warnings
         token = security.vault.issue(plan_id)
 
         with self._lock:
@@ -439,6 +460,47 @@ class PlanManager:
         self._persist(plan)
         bus.publish("duddy.plan.aborted", {"plan_id": plan.id, "reason": plan.error})
         return plan
+
+    def build_rollback(self, plan_id: str) -> List[Dict[str, Any]]:
+        """根据已成功执行的步骤，反向生成撤销操作。
+
+        只有两类能可靠撤销：
+          create_node → delete_node(node_id)
+          connect     → disconnect(link_id)
+        delete_node / set_widget 不可逆，这里跳过（调用方要单独提示用户）。
+        """
+        plan = self.get(plan_id)
+        ops: List[Dict[str, Any]] = []
+        for r in reversed(plan.results):
+            if not r.get("ok"):
+                continue
+            idx = r.get("index")
+            det = r.get("detail") or {}
+            try:
+                step = plan.steps[int(idx)]  # type: ignore[index]
+            except Exception:
+                continue
+            kind = step.get("kind")
+            if kind == "create_node" and det.get("node_id") is not None:
+                t = det.get("type") or (step.get("args") or {}).get("type")
+                ops.append(
+                    {
+                        "kind": "delete_node",
+                        "title": f"撤销：删除 {t}",
+                        "why": f"回滚 {plan_id} 第 {int(idx) + 1} 步",
+                        "args": {"node_id": det["node_id"]},
+                    }
+                )
+            elif kind == "connect" and det.get("link_id") is not None:
+                ops.append(
+                    {
+                        "kind": "disconnect",
+                        "title": f"撤销：断开连线 {det['link_id']}",
+                        "why": f"回滚 {plan_id} 第 {int(idx) + 1} 步",
+                        "args": {"link_id": det["link_id"]},
+                    }
+                )
+        return ops
 
     def gc(self, keep: int = 50) -> int:
         with self._lock:

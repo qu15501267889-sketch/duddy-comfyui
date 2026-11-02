@@ -279,6 +279,20 @@ WebSocket 事件（ComfyUI 原生 `/ws`）：
 
 ---
 
+## 能力矩阵
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| 画布建节点 / 连线 / 改参数 / 移动 / 删除 | 已实现 | litegraph 原生操作，实时可见 |
+| 节点知识库 | 已实现 | 从运行时注册表同步，本机 1301 个类型 |
+| 计划预检 | 已实现 | 类型 / 参数名 / 模型文件三重校验，动手前拦截 |
+| 执行进度 | 已实现 | hook send_sync，节点级 + 步数 + ETA |
+| 实时日志 | 已实现 | logging Handler + stdout 劫持 |
+| 文件变更监控 | 已实现 | 零依赖轮询，2s 间隔 |
+| 失败回滚 | 已实现 | 撤销已建的节点和连线 |
+| 代跑图 | 已实现 | `execute` kind，graphToPrompt + queuePrompt |
+| subgraph / group | 未实现 | 返回 skipped |
+
 ## 路线图
 
 - [x] **M0** 骨架 + WebSocket 事件总线 + 安装器

@@ -210,7 +210,7 @@ function flashNode(node, color) {
   }, 130);
 }
 
-function executeOp(op) {
+async function executeOp(op) {
   const kind = op.kind;
   const a = op.args || {};
   const g = GRAPH();
@@ -279,10 +279,30 @@ function executeOp(op) {
         return {
           ok: true,
           detail: {
+            link_id: link.id,
             from: { node: from.id, title: from.title, slot: fs },
             to: { node: to.id, title: to.title, slot: ts },
           },
         };
+      }
+
+      case "disconnect": {
+        const lid = Number(a.link_id);
+        const links = g.links || {};
+        const link = links[lid] || (Array.isArray(links) ? links.find((x) => Array.isArray(x) && x[0] === lid) : null);
+        if (!link) return Promise.resolve({ ok: false, detail: { reason: "link_not_found", link_id: lid } });
+        const originId = Array.isArray(link) ? link[1] : link.origin_id;
+        const originSlot = Array.isArray(link) ? link[2] : link.origin_slot;
+        const targetId = Array.isArray(link) ? link[3] : link.target_id;
+        const from = g.getNodeById ? g.getNodeById(originId) : null;
+        const to = g.getNodeById ? g.getNodeById(targetId) : null;
+        if (from && typeof from.disconnectOutput === "function") {
+          from.disconnectOutput(originSlot, to);
+        } else if (to && typeof to.disconnectInput === "function") {
+          to.disconnectInput(Array.isArray(link) ? link[4] : link.target_slot);
+        }
+        g.setDirtyCanvas(true, true);
+        return Promise.resolve({ ok: true, detail: { link_id: lid } });
       }
 
       case "set_widget": {
@@ -318,11 +338,16 @@ function executeOp(op) {
       case "group":
         return { ok: true, detail: { skipped: "group not implemented yet" } };
 
-      case "execute":
-        return {
-          ok: false,
-          detail: { reason: "not_implemented", hint: "execute 在 M3 开放，当前请手动点 Queue" },
-        };
+      case "execute": {
+        setPill("正在提交队列…", 0);
+        const prompt = await app.graphToPrompt();
+        if (!prompt || !prompt.output) {
+          return { ok: false, detail: { reason: "graph_to_prompt_failed" } };
+        }
+        const res = await api.queuePrompt(0, prompt);
+        const pid = (res && res.prompt_id) || null;
+        return { ok: true, detail: { prompt_id: pid, queued: true } };
+      }
 
       default:
         return { ok: false, detail: { reason: "unknown_kind", kind } };
@@ -353,7 +378,7 @@ async function runStep(payload) {
   if (dry_run) {
     res = { ok: true, detail: { dry_run: true } };
   } else {
-    res = executeOp(op);
+    res = await executeOp(op);
     await new Promise((r) => setTimeout(r, op.kind === "create_node" ? 260 : 90));
   }
 

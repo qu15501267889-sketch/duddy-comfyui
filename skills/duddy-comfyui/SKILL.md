@@ -35,74 +35,84 @@ description: 在用户正在看的 ComfyUI 画布上搭建/修改工作流。当
 
 ## 标准流程
 
-### 第一步：看现场
+### 第一步：先查，再想，最后才说
+
+**不要凭记忆写节点名和参数名。** 你脑子里的节点名，用户机器上八成没有。
 
 ```
-duddy_ping            → 扩展在不在线
-duddy_canvas_state    → 画布上已经有什么（可选 include_graph=true 看节点类型）
+duddy_ping                              → 扩展在不在线
+duddy_search_nodes("关键词")             → 这台机器上到底有哪些节点
+duddy_node_info("节点类型")              → 它要什么输入、有哪些 widget、可选值是什么
+duddy_list_models("vae")                → 模型文件名到底是啥
+duddy_canvas_state                      → 画布上已经有什么
 ```
 
-画布是空就从零搭；已经有东西就先想清楚是"接着搭"还是"另起一块"，别覆盖他的工作。
+规划一个节点之前，这三件事必须确认：**类型存在、参数名存在、模型文件存在**。
 
-### 第二步：在聊天里讲计划（不调工具）
-
-像个正常同事那样说：
-
-> 我要在画布右下方搭一条最小链路，5 个节点：
-> 1. CheckpointLoaderSimple 加载 xxx.safetensors
-> 2. CLIPTextEncode 放正向提示词
-> 3. CLIPTextEncode 放负向
-> 4. KSampler 接 1 的 MODEL、2/3 的 CONDITIONING
-> 5. VAEDecode + SaveImage 出图
->
-> 一共 12 步（每建一个节点一步、每连一条线一步）。要动手吗？
-
-**然后停。不要顺手就把工具调了。**
-
-### 第三步：用户确认后才执行
+### 第二步：提交前先模拟一遍
 
 ```
-duddy_plan_workflow(
-  title="最小文生图链路",
-  summary="从零搭一条能出图的最短路径",
-  steps=[
-    {kind:"create_node", title:"建 Checkpoint 加载器", why:"整条链的起点",
-     args:{type:"CheckpointLoaderSimple", ref:"ckpt", pos:[100,200],
-           widgets:{ckpt_name:"xxx.safetensors"}}},
-    {kind:"create_node", title:"建正向提示词", why:"描述要画什么",
-     args:{type:"CLIPTextEncode", ref:"pos", pos:[450,120],
-           widgets:{text:"a cat, masterpiece"}}},
-    {kind:"connect", title:"CLIP → 正向提示词", why:"文本编码需要 CLIP",
-     args:{from_ref:"ckpt", from_slot:1, to_ref:"pos", to_slot:0}}
-  ]
-)
+duddy_precheck_plan(steps)
 ```
 
-调用后**返回时它通常已经跑完了**（`state=done` 或 `failed`）。不用再调 `duddy_apply_step`。
+它会告诉你：节点在不在、参数名对不对、模型文件有没有、别名引用对不对。
+**passed=false 就改，别硬上。** 硬上的后果是执行到一半失败，画布上留一堆半成品。
 
-**粒度纪律**：一个节点一步，一条连线一步。这样你能精确定位是哪一步炸的。
+### 第三步：在聊天里讲计划（不调执行工具）
 
-**别名纪律**：`create_node` 必须给 `ref`，后续用 `ref` 引用，绝不猜 `node_id`。
+像正常同事那样说：
 
-### 第四步：回报结果
+> 我要搭一条最小文生图链路，4 个节点 4 条连线：
+> UnetLoaderGGUFAdvanced(Q8_0) + CLIPLoader + VAELoader → 集成采样器 → SaveImage
+> 1024×1536，20 步，cfg 1。要动手吗？
+
+**然后停。**
+
+### 第四步：用户确认后执行
 
 ```
-✓ 建了 5 个节点、连了 4 条线
-  CheckpointLoaderSimple  node_id=12  (100,200)
-  CLIPTextEncode          node_id=13  (450,120)
+duddy_plan_workflow(title=..., summary=..., steps=[...])
+```
+
+auto 模式下**返回时通常已经跑完了**（`state=done` 或 `failed`）。
+
+### 第五步：回报 + 教会用户
+
+```
+✓ 建了 4 个节点、连了 4 条线，共 9 步
+  UnetLoaderGGUFAdvanced  node_id=1  (80,80)   float16 dequant
   ...
-要不要现在跑一下？
 ```
 
-## 出错怎么处理
+## 出问题的时候
 
-| 返回 | 意思 | 你该做什么 |
-|---|---|---|
-| `unknown_node_type` | 缺插件 | 告诉用户缺哪个节点包 |
-| `connect_rejected` | 类型不匹配 | 把 `from.type` / `to.type` 摆出来，说明为什么连不上 |
-| `widget_failed` | 参数名不对 | 把 `available` 列表给他选 |
-| `frontend_timeout` | 浏览器没响应 | 让他确认页面开着、F12 有没有报错 |
-| `no_frontend` | 没浏览器连接 | 让他先打开 ComfyUI 页面 |
+**先看日志，别猜。**
+
+```
+duddy_get_logs(level="ERROR")     → 报错原文
+duddy_run_status()                → 卡在哪个节点、第几步、ETA
+duddy_fs_changes()                → 是不是刚装了什么东西导致的
+```
+
+**执行到一半失败 → 回滚**：
+
+```
+duddy_rollback_plan(plan_id)
+```
+
+它会把已经建好的节点、连好的线全撤掉，画布回到动手前的样子。
+（注意：删掉的节点和改过的参数撤不回来，只有新建的能撤。）
+
+**常见错误对照表**
+
+| 现象 | 先查什么 |
+|---|---|
+| 节点建不出来 `unknown_node_type` | `duddy_search_nodes` 看真正叫什么 |
+| 参数没生效 | `duddy_node_info` 看 widget 真名 |
+| 模型找不到 | `duddy_list_models` 看目录里到底有什么 |
+| 连线被拒 `connect_rejected` | 回报里有 from.type / to.type，类型不匹配 |
+| 卡住不动 | `duddy_run_status` + `duddy_get_logs` |
+| 出黑图/花屏 | 查显存、查 fp16 溢出、查有没有加奇怪的加速节点 |
 
 失败就停下来说，别自己换姿势重试。
 

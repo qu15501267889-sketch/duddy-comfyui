@@ -227,6 +227,108 @@ TOOLS: List[Dict[str, Any]] = [
             },
         },
     },
+    {
+        "name": "duddy_search_nodes",
+        "description": (
+            "搜索这台机器上真实存在的节点类型。"
+            "【规划前必查】不要凭记忆写节点名，先搜一下确认它真的装了。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "q": {"type": "string", "description": "关键词，如 qwen / sampler / upscale"},
+                "limit": {"type": "integer", "default": 15},
+            },
+            "required": ["q"],
+        },
+    },
+    {
+        "name": "duddy_node_info",
+        "description": (
+            "查某个节点类型的完整定义：需要哪些输入、有哪些 widget、可选值是什么、输出什么。"
+            "写 widgets 之前必须查，否则参数名写错会直接失败。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"node_type": {"type": "string"}},
+            "required": ["node_type"],
+        },
+    },
+    {
+        "name": "duddy_list_models",
+        "description": (
+            "列出模型文件。不带 folder 时返回所有模型目录名；带 folder 返回该目录下的文件名。"
+            "写死模型名之前查一下，避免文件不存在。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "folder": {"type": "string", "description": "如 checkpoints / loras / vae / diffusion_models / text_encoders"},
+            },
+        },
+    },
+    {
+        "name": "duddy_precheck_plan",
+        "description": (
+            "只检查不执行：把计划丢进来，看它在这台机器上跑不跑得通"
+            "（节点在不在、参数名对不对、模型文件有没有）。"
+            "不确定的活儿先 precheck 一下，比失败后再回滚便宜。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "steps": {"type": "array", "items": {"type": "object"}},
+            },
+            "required": ["steps"],
+        },
+    },
+    {
+        "name": "duddy_run_status",
+        "description": (
+            "当前跑到哪一步了：哪个节点、第几步/共几步、已完成哪些、预计还要多久、有没有报错。"
+            "用户问「跑到哪了」或你想确认任务是否结束时调。"
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "duddy_get_logs",
+        "description": (
+            "读 ComfyUI 的运行日志（包含节点里的 print）。"
+            "出图报错、加载失败、卡住不动时，先看日志再猜原因。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "default": 80},
+                "level": {"type": "string", "description": "ERROR / WARNING / PRINT 等，可空"},
+                "contains": {"type": "string", "description": "只返回包含该子串的行"},
+            },
+        },
+    },
+    {
+        "name": "duddy_fs_changes",
+        "description": (
+            "最近哪些文件变了：新增/修改/删除了哪些模型、插件、工作流。"
+            "用户说「我刚装了个节点」或者怀疑文件被改时用。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "default": 10}},
+        },
+    },
+    {
+        "name": "duddy_rollback_plan",
+        "description": (
+            "把某个计划已经做过的建节点/连线动作撤销掉。"
+            "执行到一半失败、或者用户说「撤了重来」时用。"
+            "注意：删除节点和改参数无法撤销，只有新建的能撤。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"plan_id": {"type": "string"}},
+            "required": ["plan_id"],
+        },
+    },
 ]
 
 
@@ -415,6 +517,113 @@ def tool_events(args: Dict[str, Any]) -> Dict[str, Any]:
     return _txt(data, is_error=status != 200)
 
 
+def tool_search_nodes(args: Dict[str, Any]) -> Dict[str, Any]:
+    q = urllib.parse.quote(str(args.get("q") or ""))
+    limit = int(args.get("limit") or 15)
+    status, data = call("GET", f"/duddy/nodes/search?q={q}&limit={limit}")
+    if status != 200 or not data.get("ok"):
+        return _txt(data, is_error=True)
+    d = data["data"]
+    return _txt(
+        {
+            "query": d.get("query"),
+            "hit_count": len(d.get("hits") or []),
+            "total_types_on_this_machine": d.get("total_types"),
+            "hits": d.get("hits"),
+        }
+    )
+
+
+def tool_node_info(args: Dict[str, Any]) -> Dict[str, Any]:
+    t = str(args.get("node_type") or "")
+    status, data = call("GET", f"/duddy/node/{urllib.parse.quote(t)}")
+    if status == 200 and data.get("ok"):
+        d = data["data"]
+        return _txt(
+            {
+                "type": d.get("type"),
+                "category": d.get("category"),
+                "required": d.get("required"),
+                "optional": d.get("optional"),
+                "outputs": d.get("outputs"),
+                "output_names": d.get("output_names"),
+            }
+        )
+    return _txt(data, is_error=True)
+
+
+def tool_list_models(args: Dict[str, Any]) -> Dict[str, Any]:
+    folder = args.get("folder")
+    path = "/duddy/models" + (f"?folder={urllib.parse.quote(str(folder))}" if folder else "")
+    status, data = call("GET", path)
+    if status != 200 or not data.get("ok"):
+        return _txt(data, is_error=True)
+    d = data["data"]
+    if folder:
+        return _txt({"folder": folder, "count": d.get("count"), "files": d.get("files")})
+    return _txt({"folders": d.get("folders"), "hint": "再带上 folder 参数查具体文件"})
+
+
+def tool_precheck_plan(args: Dict[str, Any]) -> Dict[str, Any]:
+    steps = args.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return _txt({"error": "steps 不能为空"}, is_error=True)
+    status, data = call("POST", "/duddy/precheck", {"steps": steps})
+    if status != 200 or not data.get("ok"):
+        return _txt(data, is_error=True)
+    d = data["data"]
+    return _txt(
+        {
+            "passed": d.get("passed"),
+            "errors": d.get("errors") or [],
+            "warnings": d.get("warnings") or [],
+            "next": "通过就可以去 plan_workflow；有 errors 先改，别硬上。",
+        }
+    )
+
+
+def tool_run_status(args: Dict[str, Any]) -> Dict[str, Any]:
+    status, data = call("GET", "/duddy/run")
+    if status != 200 or not data.get("ok"):
+        return _txt(data, is_error=True)
+    return _txt(data["data"])
+
+
+def tool_get_logs(args: Dict[str, Any]) -> Dict[str, Any]:
+    qs = [f"limit={int(args.get('limit') or 80)}"]
+    if args.get("level"):
+        qs.append(f"level={urllib.parse.quote(str(args['level']))}")
+    if args.get("contains"):
+        qs.append(f"contains={urllib.parse.quote(str(args['contains']))}")
+    status, data = call("GET", "/duddy/logs?" + "&".join(qs))
+    if status != 200 or not data.get("ok"):
+        return _txt(data, is_error=True)
+    d = data["data"]
+    lines = d.get("lines") or []
+    return _txt(
+        {
+            "returned": len(lines),
+            "stats": d.get("stats"),
+            "lines": [f"[{l['level']}] {l['msg']}" for l in lines],
+        }
+    )
+
+
+def tool_fs_changes(args: Dict[str, Any]) -> Dict[str, Any]:
+    status, data = call("GET", f"/duddy/fs?limit={int(args.get('limit') or 10)}")
+    if status != 200 or not data.get("ok"):
+        return _txt(data, is_error=True)
+    return _txt(data["data"])
+
+
+def tool_rollback_plan(args: Dict[str, Any]) -> Dict[str, Any]:
+    pid = args.get("plan_id")
+    if not pid:
+        return _txt({"error": "plan_id 必填"}, is_error=True)
+    status, data = call("POST", f"/duddy/plan/{urllib.parse.quote(str(pid))}/rollback", {})
+    return _txt(data, is_error=status != 200)
+
+
 HANDLERS = {
     "duddy_ping": tool_ping,
     "duddy_plan_workflow": tool_plan_workflow,
@@ -424,6 +633,14 @@ HANDLERS = {
     "duddy_abort_plan": tool_abort_plan,
     "duddy_canvas_state": tool_canvas_state,
     "duddy_events": tool_events,
+    "duddy_search_nodes": tool_search_nodes,
+    "duddy_node_info": tool_node_info,
+    "duddy_list_models": tool_list_models,
+    "duddy_precheck_plan": tool_precheck_plan,
+    "duddy_run_status": tool_run_status,
+    "duddy_get_logs": tool_get_logs,
+    "duddy_fs_changes": tool_fs_changes,
+    "duddy_rollback_plan": tool_rollback_plan,
 }
 
 

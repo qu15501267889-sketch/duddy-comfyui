@@ -466,6 +466,132 @@ async def events(request: web.Request) -> web.Response:
     return _ok(bus.recent(prefix=prefix, limit=limit, since_seq=since))
 
 
+# ------------------------------------------------------------ M6 知识库
+
+
+@_guard
+async def nodes_search(request: web.Request) -> web.Response:
+    from ..modules.registry import registry
+
+    q = request.query.get("q") or ""
+    limit = int(request.query.get("limit", 20))
+    return _ok({"query": q, "hits": registry.search(q, limit=limit), "total_types": len(registry._nodes)})
+
+
+@_guard
+async def node_info(request: web.Request) -> web.Response:
+    from ..modules.registry import registry
+
+    t = request.match_info["node_type"]
+    info = registry.get(t)
+    if info is None:
+        return _err(
+            f"节点 '{t}' 不存在", 404, "not_found",
+            suggestions=registry.suggest(t),
+        )
+    return _ok(info)
+
+
+@_guard
+async def models_list(request: web.Request) -> web.Response:
+    from ..modules.registry import registry
+
+    folder = request.query.get("folder")
+    if not folder:
+        try:
+            import folder_paths  # type: ignore
+
+            folders = sorted(getattr(folder_paths, "folder_names_and_paths", {}).keys())
+        except Exception:
+            folders = []
+        return _ok({"folders": folders})
+    files = registry.model_list(folder)
+    return _ok({"folder": folder, "count": len(files), "files": files[:500]})
+
+
+@_guard
+async def plan_precheck(request: web.Request) -> web.Response:
+    from ..modules.registry import precheck
+    from ..core.plan import _validate_steps
+
+    body = await _body(request)
+    try:
+        cleaned = _validate_steps(body.get("steps"))
+    except PlanError as e:
+        return _err(str(e), e.code, e.kind)
+    report = precheck(cleaned)
+    return _ok({"passed": not report["errors"], **report})
+
+
+@_guard
+async def plan_rollback(request: web.Request) -> web.Response:
+    """根据已完成步骤生成反向操作，并作为新计划自动执行。"""
+    src_id = request.match_info["plan_id"]
+    src = plan_manager.get(src_id)
+    ops = plan_manager.build_rollback(src_id)
+    if not ops:
+        return _err(
+            "这个计划没有可自动回滚的步骤（create_node / connect 才能撤销）",
+            409,
+            "nothing_to_rollback",
+        )
+    client_id = state.target_client()
+    new_plan, _t = plan_manager.create(
+        title=f"回滚 {src_id}",
+        summary=f"撤销「{src.title}」已经执行过的 {len(ops)} 个建节点/连线动作",
+        steps=ops,
+        notes="由 rollback 自动生成。delete_node 与 set_widget 不可逆，不在此列。",
+        client_id=client_id,
+        skip_precheck=True,
+    )
+    plan_manager.auto_approve(new_plan.id, by="rollback")
+    started = kick_auto(new_plan.id)
+    return _ok({"rollback_plan_id": new_plan.id, "op_count": len(ops), "auto_started": started})
+
+
+# ------------------------------------------------------ M3 进度 / M4 日志 / M5 文件
+
+
+@_guard
+async def run_status(request: web.Request) -> web.Response:
+    from ..modules.trace import trace
+
+    return _ok(trace.status())
+
+
+@_guard
+async def logs_tail(request: web.Request) -> web.Response:
+    from ..modules.logs import log_tap
+
+    limit = int(request.query.get("limit", 100))
+    since = int(request.query.get("since", 0))
+    level = request.query.get("level")
+    contains = request.query.get("contains")
+    return _ok(
+        {
+            "lines": log_tap.tail(limit=limit, since_seq=since, level=level, contains=contains),
+            "stats": log_tap.stats(),
+        }
+    )
+
+
+@_guard
+async def fs_state(request: web.Request) -> web.Response:
+    from ..modules.fswatch import fswatch
+
+    return _ok(
+        {
+            "summary": fswatch.summary(),
+            "recent": fswatch.recent(limit=int(request.query.get("limit", 10))),
+        }
+    )
+
+
+@_guard
+async def modules_state(request: web.Request) -> web.Response:
+    return _ok({"modules": dict(state.modules), "ready": len(state.modules)})
+
+
 # ------------------------------------------------------------------ 挂载
 
 
@@ -490,6 +616,16 @@ def build_routes():
     r.post(P + "/plan/{plan_id}/step")(plan_step)
     r.post(P + "/plan/{plan_id}/retry")(plan_retry)
     r.post(P + "/plan/{plan_id}/abort")(plan_abort)
+    r.post(P + "/plan/{plan_id}/rollback")(plan_rollback)
+    r.post(P + "/precheck")(plan_precheck)
+
+    r.get(P + "/nodes/search")(nodes_search)
+    r.get(P + "/node/{node_type}")(node_info)
+    r.get(P + "/models")(models_list)
+    r.get(P + "/run")(run_status)
+    r.get(P + "/logs")(logs_tail)
+    r.get(P + "/fs")(fs_state)
+    r.get(P + "/modules")(modules_state)
 
     r.get(P + "/events")(events)
     return r

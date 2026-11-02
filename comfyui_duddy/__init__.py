@@ -42,15 +42,51 @@ def _init() -> None:
         from .api.routes import register_routes
 
         roots = security.init_guard()
+        base = roots.get("base")
 
         # 计划审计落盘：ComfyUI/user/default/duddy/plans
         store = None
-        base = roots.get("user")
-        if base:
-            store = os.path.join(base, "default", "duddy", "plans")
+        if roots.get("user"):
+            store = os.path.join(roots["user"], "default", "duddy", "plans")
         plan_manager.set_store_dir(store)
-        if store:
-            security.guard.add_root(os.path.join(base, "default", "duddy"))
+
+        # 日志摄取最先装，才能捕获后面所有模块的启动信息
+        try:
+            from .modules.logs import log_tap
+
+            log_tap.install()
+            state.modules["logs"] = "ready" if log_tap._installed else "failed"
+        except Exception as e:
+            state.modules["logs"] = f"failed: {e}"
+            logger.warning("[duddy] 日志模块未就绪: %s", e)
+
+        # 节点知识库
+        try:
+            from .modules.registry import registry
+
+            n = registry.load()
+            state.modules["registry"] = f"ready({n})"
+        except Exception as e:
+            state.modules["registry"] = f"failed: {e}"
+            logger.warning("[duddy] 节点知识库未就绪: %s", e)
+
+        # 执行进度
+        try:
+            from .modules.trace import trace
+
+            state.modules["trace"] = "ready" if trace.install() else "failed"
+        except Exception as e:
+            state.modules["trace"] = f"failed: {e}"
+            logger.warning("[duddy] 进度追踪未就绪: %s", e)
+
+        # 文件监控
+        try:
+            from .modules.fswatch import fswatch
+
+            state.modules["fswatch"] = "ready" if fswatch.install(base) else "skipped"
+        except Exception as e:
+            state.modules["fswatch"] = f"failed: {e}"
+            logger.warning("[duddy] 文件监控未就绪: %s", e)
 
         if not register_routes():
             _error = "routes registration failed"
@@ -60,10 +96,11 @@ def _init() -> None:
         state.modules["plan"] = "ready"
         _ready = True
         logger.info(
-            "[duddy] v%s ready · roots=%s · store=%s",
+            "[duddy] v%s ready · roots=%s · store=%s · modules=%s",
             __version__,
             ",".join(sorted(roots.keys())) or "none",
             store or "memory-only",
+            state.modules,
         )
     except Exception as e:  # 绝不能因为本包把 ComfyUI 拖挂
         _error = f"{type(e).__name__}: {e}"
