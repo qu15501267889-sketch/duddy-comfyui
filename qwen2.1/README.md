@@ -54,6 +54,8 @@ Outpaint 工作流里有个 `TextGenerate` 节点，先让模型给原图写一�
 | [03-cases.md](03-cases.md) | 逐个工作流拆解（Tiled Upscale / Person Swap / Outpaint / Multi-Image Edit） |
 | [04-lessons-for-duddy.md](04-lessons-for-duddy.md) | 这些经验怎么反哺 duddy-comfyui 本身 |
 | [05-ecosystem-patterns.md](05-ecosystem-patterns.md) | 非 AusBoss 体系的工程手法：无线连接、组旁路、参数流派 |
+| [06-parameter-fingerprint.md](06-parameter-fingerprint.md) | 58 个工作流的实际参数统计：cfg/steps/denoise/LoRA/提示词 |
+| [07-node-internals.md](07-node-internals.md) | 节点内部机制反推：三输出编码器、自动 caption 配置、填充色 |
 
 ## 工作流清单（按类型）
 
